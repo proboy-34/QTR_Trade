@@ -39,6 +39,25 @@ class StrategyStatus(StrEnum):
     SUSPENDED = "suspended"
     RETIRED = "retired"
     UNDER_REVIEW = "under_review"
+    PAPER_TESTING = "paper_testing"
+    READY_FOR_REVIEW = "ready_for_review"
+
+
+class HypothesisStage(StrEnum):
+    IDEA = "IDEA"
+    RESEARCH = "RESEARCH"
+    BACKTESTING = "BACKTESTING"
+    OOS_VALIDATION = "OOS_VALIDATION"
+    WALK_FORWARD = "WALK_FORWARD"
+    ROBUSTNESS = "ROBUSTNESS"
+    PAPER_TESTING = "PAPER_TESTING"
+    PAPER_VALIDATED = "PAPER_VALIDATED"
+    CANDIDATE = "CANDIDATE"
+    ACTIVE = "ACTIVE"
+    REJECTED = "REJECTED"
+    FAILED = "FAILED"
+    DEGRADED = "DEGRADED"
+    ARCHIVED = "ARCHIVED"
 
 
 class TimestampMixin:
@@ -135,6 +154,21 @@ class Hypothesis(Base, TimestampMixin):
     test_definition: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     result: Mapped[str] = mapped_column(String(30), default="untested")
     evidence: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    stage: Mapped[str] = mapped_column(String(30), default=HypothesisStage.IDEA, index=True)
+    origin: Mapped[str] = mapped_column(String(30), default="operator", index=True)
+    description: Mapped[str] = mapped_column(Text, default="")
+    market_conditions: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    assets: Mapped[list[str]] = mapped_column(JSON, default=list)
+    timeframes: Mapped[list[str]] = mapped_column(JSON, default=list)
+    variables: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    assumptions: Mapped[list[str]] = mapped_column(JSON, default=list)
+    spec: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    decision_reason: Mapped[str] = mapped_column(Text, default="")
+    strategy_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    parent_strategy_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    ai_artifact_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    stage_history: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    trials: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class Strategy(Base, TimestampMixin):
@@ -149,6 +183,11 @@ class Strategy(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(String(30), default=StrategyStatus.DRAFT, index=True)
     author: Mapped[str] = mapped_column(String(100), default="QTR")
     is_demo: Mapped[bool] = mapped_column(Boolean, default=False)
+    origin: Mapped[str] = mapped_column(String(30), default="operator")
+    parent_strategy_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    hypothesis_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    health_status: Mapped[str] = mapped_column(String(30), default="INSUFFICIENT_DATA", index=True)
+    health_details: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     versions: Mapped[list["StrategyVersion"]] = relationship(back_populates="strategy")
 
 
@@ -204,6 +243,22 @@ class MarketEvent(Base, TimestampMixin):
     affected_assets: Mapped[list[str]] = mapped_column(JSON, default=list)
     description: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(30), default="scheduled")
+    provider: Mapped[str] = mapped_column(String(50), default="manual", index=True)
+    external_id: Mapped[str | None] = mapped_column(String(200))
+    dedup_hash: Mapped[str | None] = mapped_column(String(64), unique=True)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    # SOURCE_VERIFIED: fetched from a configured provider with a traceable reference.
+    # OPERATOR_ENTERED: manual entry. UNVERIFIED: no traceable source. Never AI-created.
+    verification_status: Mapped[str] = mapped_column(String(30), default="OPERATOR_ENTERED", index=True)
+    relevance: Mapped[float] = mapped_column(Float, default=0)
+    expected_value: Mapped[str | None] = mapped_column(String(50))
+    actual_value: Mapped[str | None] = mapped_column(String(50))
+    previous_value: Mapped[str | None] = mapped_column(String(50))
+    surprise: Mapped[float | None] = mapped_column(Float)
+    unit: Mapped[str | None] = mapped_column(String(20))
+    country: Mapped[str | None] = mapped_column(String(20))
+    raw_reference: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    processing_status: Mapped[str] = mapped_column(String(30), default="NORMALIZED", index=True)
 
 
 class Decision(Base):
@@ -217,6 +272,9 @@ class Decision(Base):
     reasoning: Mapped[list[str]] = mapped_column(JSON, default=list)
     correlation_id: Mapped[str] = mapped_column(String(36), index=True)
     selected_opportunity_id: Mapped[str | None] = mapped_column(ForeignKey("opportunities.id"), index=True)
+    exchange: Mapped[str | None] = mapped_column(String(30))
+    timeframe: Mapped[str | None] = mapped_column(String(10), index=True)
+    lineage: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=TimeService.now)
 
 
@@ -271,6 +329,8 @@ class Position(Base, TimestampMixin):
     realized_pnl: Mapped[Decimal] = mapped_column(MONEY, default=Decimal("0"))
     fees: Mapped[Decimal] = mapped_column(MONEY, default=Decimal("0"))
     exit_reason: Mapped[str | None] = mapped_column(String(100))
+    highest_price: Mapped[Decimal | None] = mapped_column(PRICE)
+    lowest_price: Mapped[Decimal | None] = mapped_column(PRICE)
     status: Mapped[str] = mapped_column(String(20), default="OPEN", index=True)
     opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=TimeService.now)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -369,6 +429,11 @@ class MarketContextRecord(Base):
     funding: Mapped[Decimal] = mapped_column(RATE, default=Decimal("0"))
     previous_regime: Mapped[str | None] = mapped_column(String(30))
     snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    exchange: Mapped[str | None] = mapped_column(String(30), index=True)
+    timeframe: Mapped[str | None] = mapped_column(String(10), index=True)
+    market_regime: Mapped[str | None] = mapped_column(String(30), index=True)
+    regime_confidence: Mapped[float | None] = mapped_column(Float)
+    features: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=TimeService.now, index=True)
 
 
@@ -376,12 +441,24 @@ class Opportunity(Base, TimestampMixin):
     __tablename__ = "opportunities"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     market_context_id: Mapped[str] = mapped_column(ForeignKey("market_contexts.id"), index=True)
-    strategy_version_id: Mapped[str] = mapped_column(ForeignKey("strategy_versions.id"), index=True)
+    # Scanner opportunities are strategy-agnostic observations; decision opportunities carry a version.
+    strategy_version_id: Mapped[str | None] = mapped_column(ForeignKey("strategy_versions.id"), index=True)
     symbol: Mapped[str] = mapped_column(String(30), index=True)
     status: Mapped[str] = mapped_column(String(20), default="QUEUED", index=True)
     score: Mapped[float] = mapped_column(Float, default=0)
     reasons: Mapped[list[str]] = mapped_column(JSON, default=list)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    source: Mapped[str] = mapped_column(String(20), default="decision", index=True)
+    exchange: Mapped[str | None] = mapped_column(String(30))
+    timeframe: Mapped[str | None] = mapped_column(String(10))
+    signals: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    regime: Mapped[str | None] = mapped_column(String(30))
+    dedup_key: Mapped[str | None] = mapped_column(String(120), index=True)
+    rank_score: Mapped[float] = mapped_column(Float, default=0)
+    rank_breakdown: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    event_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    observations: Mapped[int] = mapped_column(Integer, default=1)
 
 
 class RiskEvent(Base):
@@ -511,3 +588,213 @@ class LivePaperSession(Base):
     reconnects: Mapped[int] = mapped_column(Integer, default=0)
     last_error: Mapped[str | None] = mapped_column(Text)
     configuration: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class AssetEligibility(Base):
+    """Immutable per-run eligibility verdict for one instrument."""
+
+    __tablename__ = "asset_eligibility"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    run_id: Mapped[str] = mapped_column(String(36), index=True)
+    exchange: Mapped[str] = mapped_column(String(30), index=True)
+    symbol: Mapped[str] = mapped_column(String(30), index=True)
+    base_asset: Mapped[str] = mapped_column(String(20))
+    quote_asset: Mapped[str] = mapped_column(String(20))
+    eligible: Mapped[bool] = mapped_column(Boolean, index=True)
+    reasons: Mapped[list[str]] = mapped_column(JSON, default=list)
+    metrics: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    rank: Mapped[int | None] = mapped_column(Integer)
+    evaluated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=TimeService.now, index=True)
+
+
+class MarketRegimeRecord(Base):
+    __tablename__ = "market_regimes"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    exchange: Mapped[str] = mapped_column(String(30), index=True)
+    symbol: Mapped[str] = mapped_column(String(30), index=True)
+    timeframe: Mapped[str] = mapped_column(String(10), index=True)
+    regime: Mapped[str] = mapped_column(String(30), index=True)
+    confidence: Mapped[float] = mapped_column(Float, default=0)
+    evidence: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    previous_regime: Mapped[str | None] = mapped_column(String(30))
+    is_transition: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    candle_timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=TimeService.now, index=True)
+    __table_args__ = (
+        Index("ix_market_regime_unique", "exchange", "symbol", "timeframe", "candle_timestamp", unique=True),
+    )
+
+
+class AICallRecord(Base):
+    __tablename__ = "ai_calls"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    provider: Mapped[str] = mapped_column(String(30), index=True)
+    model: Mapped[str] = mapped_column(String(80))
+    task_type: Mapped[str] = mapped_column(String(50), index=True)
+    status: Mapped[str] = mapped_column(String(20), index=True)
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    estimated_cost: Mapped[Decimal] = mapped_column(MONEY, default=Decimal("0"))
+    latency_ms: Mapped[int] = mapped_column(Integer, default=0)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    request_hash: Mapped[str] = mapped_column(String(64), index=True)
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=TimeService.now, index=True)
+
+
+class AIArtifact(Base):
+    """AI output kept separate from facts. Claims carry their own verification status."""
+
+    __tablename__ = "ai_artifacts"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    ai_call_id: Mapped[str | None] = mapped_column(ForeignKey("ai_calls.id"), index=True)
+    task_type: Mapped[str] = mapped_column(String(50), index=True)
+    subject_type: Mapped[str] = mapped_column(String(30), index=True)
+    subject_id: Mapped[str | None] = mapped_column(String(100), index=True)
+    summary: Mapped[str] = mapped_column(Text, default="")
+    claims: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    proposals: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    context_refs: Mapped[list[str]] = mapped_column(JSON, default=list)
+    verification: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    model: Mapped[str] = mapped_column(String(80), default="")
+    prompt_version: Mapped[str] = mapped_column(String(20), default="v1")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=TimeService.now, index=True)
+
+
+class TradeMemory(Base):
+    """Immutable closed-trade record. One row per closed position; never updated."""
+
+    __tablename__ = "trade_memory"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    position_id: Mapped[str] = mapped_column(ForeignKey("positions.id"), unique=True)
+    symbol: Mapped[str] = mapped_column(String(30), index=True)
+    side: Mapped[str] = mapped_column(String(10))
+    quantity: Mapped[Decimal] = mapped_column(QUANTITY)
+    leverage: Mapped[Decimal] = mapped_column(RATE, default=Decimal("1"))
+    entry_price: Mapped[Decimal] = mapped_column(PRICE)
+    exit_price: Mapped[Decimal] = mapped_column(PRICE)
+    reference_price: Mapped[Decimal | None] = mapped_column(PRICE)
+    fees: Mapped[Decimal] = mapped_column(MONEY)
+    slippage_cost: Mapped[Decimal] = mapped_column(MONEY, default=Decimal("0"))
+    realized_pnl: Mapped[Decimal] = mapped_column(MONEY)
+    net_pnl: Mapped[Decimal] = mapped_column(MONEY)
+    return_pct: Mapped[float] = mapped_column(Float)
+    r_multiple: Mapped[float | None] = mapped_column(Float)
+    mae_pct: Mapped[float | None] = mapped_column(Float)
+    mfe_pct: Mapped[float | None] = mapped_column(Float)
+    holding_seconds: Mapped[int] = mapped_column(Integer)
+    exit_reason: Mapped[str] = mapped_column(String(100))
+    strategy_version_id: Mapped[str] = mapped_column(String(36), index=True)
+    decision_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    trade_intent_id: Mapped[str | None] = mapped_column(String(36))
+    execution_plan_id: Mapped[str | None] = mapped_column(String(36))
+    timeframe: Mapped[str | None] = mapped_column(String(10))
+    regime_at_entry: Mapped[str | None] = mapped_column(String(30), index=True)
+    regime_at_exit: Mapped[str | None] = mapped_column(String(30))
+    event_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    stop_loss: Mapped[Decimal] = mapped_column(PRICE)
+    take_profit: Mapped[Decimal] = mapped_column(PRICE)
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    closed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    lineage: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=TimeService.now)
+
+
+class PostTradeAnalysis(Base):
+    __tablename__ = "post_trade_analyses"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    trade_memory_id: Mapped[str] = mapped_column(ForeignKey("trade_memory.id"), unique=True)
+    expected: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    actual: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    thesis_correct: Mapped[bool | None] = mapped_column(Boolean)
+    entry_quality: Mapped[str] = mapped_column(String(30))
+    exit_quality: Mapped[str] = mapped_column(String(30))
+    factors: Mapped[list[str]] = mapped_column(JSON, default=list)
+    lesson: Mapped[str] = mapped_column(Text, default="")
+    knowledge_entry_id: Mapped[str | None] = mapped_column(String(36))
+    ai_artifact_id: Mapped[str | None] = mapped_column(String(36))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=TimeService.now, index=True)
+
+
+class KnowledgeEntry(Base):
+    """Queryable research memory. source_type separates system facts from AI interpretation."""
+
+    __tablename__ = "knowledge_entries"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    kind: Mapped[str] = mapped_column(String(40), index=True)
+    title: Mapped[str] = mapped_column(String(300))
+    body: Mapped[str] = mapped_column(Text, default="")
+    evidence: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    refs: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    tags: Mapped[list[str]] = mapped_column(JSON, default=list)
+    symbol: Mapped[str | None] = mapped_column(String(30), index=True)
+    timeframe: Mapped[str | None] = mapped_column(String(10))
+    regime: Mapped[str | None] = mapped_column(String(30), index=True)
+    source_type: Mapped[str] = mapped_column(String(30), default="SYSTEM_DERIVED", index=True)
+    evidence_count: Mapped[int] = mapped_column(Integer, default=1)
+    dedup_key: Mapped[str | None] = mapped_column(String(160), unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=TimeService.now, index=True)
+
+
+class CounterfactualEvaluation(Base):
+    __tablename__ = "counterfactuals"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    decision_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    opportunity_id: Mapped[str | None] = mapped_column(String(36), unique=True)
+    exchange: Mapped[str] = mapped_column(String(30))
+    symbol: Mapped[str] = mapped_column(String(30), index=True)
+    timeframe: Mapped[str] = mapped_column(String(10))
+    decision_outcome: Mapped[str] = mapped_column(String(30))
+    rejection_category: Mapped[str] = mapped_column(String(40), index=True)
+    rejection_reasons: Mapped[list[str]] = mapped_column(JSON, default=list)
+    reference_price: Mapped[Decimal] = mapped_column(PRICE)
+    reference_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    horizon_bars: Mapped[int] = mapped_column(Integer)
+    forward_return_pct: Mapped[float | None] = mapped_column(Float)
+    max_up_pct: Mapped[float | None] = mapped_column(Float)
+    max_down_pct: Mapped[float | None] = mapped_column(Float)
+    verdict: Mapped[str | None] = mapped_column(String(30), index=True)
+    status: Mapped[str] = mapped_column(String(20), default="PENDING", index=True)
+    evaluated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=TimeService.now, index=True)
+
+
+class StrategyHealthRecord(Base):
+    __tablename__ = "strategy_health"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    strategy_id: Mapped[str] = mapped_column(ForeignKey("strategies.id"), index=True)
+    strategy_version_id: Mapped[str | None] = mapped_column(String(36))
+    status: Mapped[str] = mapped_column(String(30), index=True)
+    historical: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    recent: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    by_regime: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    reasons: Mapped[list[str]] = mapped_column(JSON, default=list)
+    evaluated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=TimeService.now, index=True)
+
+
+class DiscrepancyReport(Base):
+    __tablename__ = "discrepancy_reports"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    strategy_version_id: Mapped[str] = mapped_column(String(36), index=True)
+    backtest: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    paper: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    differences: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    explanations: Mapped[list[str]] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=TimeService.now, index=True)
+
+
+class SafetyControl(Base):
+    """Kill-switch record. Automatic triggers stay active until an operator clears them."""
+
+    __tablename__ = "safety_controls"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    scope: Mapped[str] = mapped_column(String(30), index=True)
+    target: Mapped[str] = mapped_column(String(100), default="*", index=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    reason: Mapped[str] = mapped_column(Text)
+    trigger: Mapped[str] = mapped_column(String(50), default="OPERATOR")
+    source: Mapped[str] = mapped_column(String(30), default="operator")
+    details: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    triggered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=TimeService.now, index=True)
+    cleared_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cleared_by: Mapped[str | None] = mapped_column(String(100))

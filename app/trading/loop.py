@@ -1,14 +1,29 @@
 from collections.abc import AsyncIterable
+from decimal import Decimal
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
-from app.core.decimal_math import ZERO, decimal, money, price
+from app.core.decimal_math import ONE, ZERO, decimal, money, price
 from app.core.events import Event, EventBus, publish_persisted
-from app.models import Position
-from app.trading.pipeline import MarketSnapshot, TradingPipeline
-from app.trading.positions import PositionManager
+from app.memory.trade_memory import TradeMemoryService
+from app.models import Position, StrategyVersion
+from app.research.dsl import spec_from_version
+from app.trading.pipeline import MarketSnapshot, TradingPipeline, latest_signals
+from app.trading.positions import PositionManager, track_extremes
+
+
+def exit_reason(position: Position, mark: Decimal) -> str | None:
+    if position.side == "BUY" and mark <= decimal(position.stop_loss):
+        return "stop_loss"
+    if position.side == "BUY" and mark >= decimal(position.take_profit):
+        return "take_profit"
+    if position.side == "SELL" and mark >= decimal(position.stop_loss):
+        return "stop_loss"
+    if position.side == "SELL" and mark <= decimal(position.take_profit):
+        return "take_profit"
+    return None
 
 
 class PaperTradingLoop:
@@ -16,6 +31,37 @@ class PaperTradingLoop:
 
     def __init__(self, session: Session, settings: Settings, event_bus: EventBus) -> None:
         self.session, self.settings, self.event_bus = session, settings, event_bus
+
+    def exit_fill(self, position: Position, mark: Decimal) -> Decimal:
+        """Protective exits are market orders: slippage and half the spread apply against us.
+
+        A gap through the stop fills at the (worse) observed price, never at the stop level.
+        """
+        adverse = decimal(self.settings.paper_slippage_rate) + decimal(self.settings.paper_spread_bps) / 20_000
+        return price(mark * (ONE - adverse if position.side == "BUY" else ONE + adverse))
+
+    async def _close(self, position: Position, mark: Decimal, reason: str, source: str) -> None:
+        manager = PositionManager(self.session, self.settings.paper_fee_rate)
+        manager.close(position, self.exit_fill(position, mark), reason)
+        trade = TradeMemoryService(self.session).record(position)
+        await publish_persisted(
+            self.session, self.event_bus,
+            Event("PositionClosed", {"position_id": position.id, "reason": reason}, source=source),
+            "positions",
+        )
+        await publish_persisted(self.session, self.event_bus, Event("TRADE_CLOSED", {
+            "position_id": position.id, "trade_memory_id": trade.id if trade else None, "symbol": position.symbol,
+            "reason": reason, "net_pnl": str(trade.net_pnl) if trade else None,
+        }, source=source), "positions")
+
+    def _strategy_exit(self, position: Position, snapshot: MarketSnapshot) -> str | None:
+        """Apply the strategy's own declarative exit rule on the closed candle (as in research)."""
+        version = self.session.get(StrategyVersion, position.strategy_version_id)
+        spec = spec_from_version(version, version.strategy) if version else None
+        if spec is None or not spec.exit or snapshot.timeframe not in spec.timeframes:
+            return None
+        signals, _ = latest_signals(self.session, spec, snapshot)
+        return "strategy_exit" if signals and signals["exit"] else None
 
     async def process(self, snapshot: MarketSnapshot) -> dict:
         decision = await TradingPipeline(self.session, self.settings, self.event_bus).evaluate(snapshot)
@@ -30,28 +76,10 @@ class PaperTradingLoop:
             mark = decimal(snapshot.price)
             manager.mark(position, snapshot.price)
             managed.append(position.id)
-            reason = None
-            if position.side == "BUY" and mark <= decimal(position.stop_loss):
-                reason = "stop_loss"
-            elif position.side == "BUY" and mark >= decimal(position.take_profit):
-                reason = "take_profit"
-            elif position.side == "SELL" and mark >= decimal(position.stop_loss):
-                reason = "stop_loss"
-            elif position.side == "SELL" and mark <= decimal(position.take_profit):
-                reason = "take_profit"
+            reason = exit_reason(position, mark) or self._strategy_exit(position, snapshot)
             if reason:
-                manager.close(position, snapshot.price, reason)
+                await self._close(position, mark, reason, "position_management")
                 closed.append(position.id)
-                await publish_persisted(
-                    self.session,
-                    self.event_bus,
-                    Event(
-                        "PositionClosed",
-                        {"position_id": position.id, "reason": reason},
-                        source="position_management",
-                    ),
-                    "positions",
-                )
         self.session.commit()
         return {"decision": decision, "managed_positions": managed, "closed_positions": closed}
 
@@ -69,35 +97,17 @@ class PaperTradingLoop:
         )).all()
         mark = price(price_value)
         closed: list[str] = []
-        manager = PositionManager(self.session, self.settings.paper_fee_rate)
         for position in positions:
             direction = decimal(1 if position.side == "BUY" else -1)
             position.current_price = mark
+            track_extremes(position, mark)
             position.unrealized_pnl = money(
                 (mark - decimal(position.entry_price)) * decimal(position.quantity) * direction
             )
-            reason = None
-            if position.side == "BUY" and mark <= decimal(position.stop_loss):
-                reason = "stop_loss"
-            elif position.side == "BUY" and mark >= decimal(position.take_profit):
-                reason = "take_profit"
-            elif position.side == "SELL" and mark >= decimal(position.stop_loss):
-                reason = "stop_loss"
-            elif position.side == "SELL" and mark <= decimal(position.take_profit):
-                reason = "take_profit"
+            reason = exit_reason(position, mark)
             if reason:
-                manager.close(position, price_value, reason)
+                await self._close(position, mark, reason, "live_paper_monitor")
                 closed.append(position.id)
-                await publish_persisted(
-                    self.session,
-                    self.event_bus,
-                    Event(
-                        "PositionClosed",
-                        {"position_id": position.id, "reason": reason},
-                        source="live_paper_monitor",
-                    ),
-                    "positions",
-                )
             elif position.unrealized_pnl == ZERO:
                 position.unrealized_pnl = ZERO
         if positions:

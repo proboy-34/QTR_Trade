@@ -33,10 +33,80 @@ class Settings(BaseSettings):
     live_paper_autostart: bool = False
     live_paper_provider: Literal["binance"] = "binance"
     live_paper_symbol: str = "BTCUSDT"
+    # Optional comma-separated multi-asset live stream; empty uses LIVE_PAPER_SYMBOL only.
+    live_paper_symbols: str = ""
     live_paper_timeframe: Literal["1m", "5m", "15m", "1h", "4h", "1d"] = "1h"
     live_paper_bootstrap_candles: int = Field(120, ge=35, le=1000)
     live_paper_max_backoff_seconds: int = Field(30, ge=1, le=300)
     cors_origins: str = "http://localhost:5173,http://localhost:4173"
+    paper_spread_bps: float = Field(2.0, ge=0, le=500)
+
+    # Authentication foundation: local_demo grants every role to a local operator.
+    # token mode reads AUTH_TOKENS="token:role|role,token2:viewer" (server-side only).
+    auth_mode: Literal["local_demo", "token"] = "local_demo"
+    auth_tokens: str = ""
+
+    # Multi-asset universe (public exchange metadata; no credentials required)
+    universe_provider: Literal["binance"] = "binance"
+    binance_public_base_url: str = "https://api.binance.com"
+    binance_ws_base_url: str = "wss://stream.binance.com:9443"
+    universe_quote_assets: str = "USDT"
+    universe_min_quote_volume_24h: float = Field(20_000_000, ge=0)
+    universe_max_spread_bps: float = Field(15, gt=0)
+    universe_max_abs_change_24h_pct: float = Field(40, gt=0)
+    universe_min_history_candles: int = Field(200, ge=35)
+    universe_max_assets: int = Field(25, ge=1, le=200)
+    universe_exclude_bases: str = "USDC,FDUSD,TUSD,USDP,DAI,BUSD,EUR,TRY,BRL,GBP,AEUR,USDE,PAXG,WBTC,WBETH,BFUSD,XUSD,RLUSD"
+    universe_include_symbols: str = ""
+    universe_refresh_seconds: int = Field(21_600, ge=300)
+
+    # Market scanner / regime
+    market_scanner_enabled: bool = True
+    scanner_exchange: str = "binance"
+    scanner_timeframes: str = "1h"
+    scanner_interval_seconds: int = Field(300, ge=30)
+    market_sync_enabled: bool = True
+    market_sync_interval_seconds: int = Field(300, ge=30)
+    opportunity_ttl_minutes: int = Field(240, ge=5)
+
+    # Market intelligence (news / macro). Empty provider = manual events only.
+    news_provider: Literal["", "cryptopanic", "finnhub"] = ""
+    news_provider_api_key: str = ""
+    news_provider_base_url: str = ""
+    macro_provider: Literal["", "finnhub"] = ""
+    macro_provider_api_key: str = ""
+    news_ingestion_interval_seconds: int = Field(900, ge=60)
+
+    # AI research assistant (never an order authority)
+    ai_provider: Literal["", "gemini"] = "gemini"
+    ai_enabled: bool = True
+    gemini_api_key: str = ""
+    gemini_model: str = "gemini-2.5-flash"
+    gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
+    ai_timeout_seconds: float = Field(30, gt=0, le=300)
+    ai_max_retries: int = Field(2, ge=0, le=5)
+    ai_max_output_tokens: int = Field(2048, ge=64, le=65_536)
+    ai_daily_budget: float = Field(1.0, ge=0)
+    ai_monthly_budget: float = Field(20.0, ge=0)
+    ai_max_requests_per_hour: int = Field(30, ge=0)
+    ai_input_cost_per_mtok: float = Field(0.30, ge=0)
+    ai_output_cost_per_mtok: float = Field(2.50, ge=0)
+
+    # Research loop and learning
+    autonomous_research_enabled: bool = True
+    research_interval_seconds: int = Field(600, ge=30)
+    research_max_hypotheses_per_run: int = Field(3, ge=1, le=50)
+    learning_interval_seconds: int = Field(900, ge=60)
+    counterfactual_horizon_bars: int = Field(12, ge=1, le=500)
+
+    # Portfolio intelligence and safety
+    max_correlated_exposure: float = Field(0.35, gt=0, le=1)
+    max_symbol_concentration: float = Field(0.25, gt=0, le=1)
+    correlation_threshold: float = Field(0.7, gt=0, le=1)
+    safety_monitor_interval_seconds: int = Field(60, ge=10)
+    safety_max_stale_seconds: int = Field(900, ge=30)
+    safety_max_execution_errors: int = Field(5, ge=1)
+    safety_max_price_jump_pct: float = Field(25, gt=0)
 
     binance_api_key: str = ""
     binance_api_secret: str = ""
@@ -59,9 +129,16 @@ class Settings(BaseSettings):
                 )
         if self.app_env == "live" and "*" in self.cors_origins.split(","):
             raise ValueError("Wildcard CORS is forbidden in live environment")
+        if self.auth_mode == "token" and not self.auth_tokens.strip():
+            raise ValueError("AUTH_MODE=token requires AUTH_TOKENS")
         if self.live_paper_autostart and self.trading_mode != "paper":
             raise ValueError("Live-data paper mode requires TRADING_MODE=paper")
         return self
+
+
+    def csv(self, name: str) -> list[str]:
+        value = getattr(self, name)
+        return [item.strip() for item in str(value).split(",") if item.strip()]
 
 
 @lru_cache

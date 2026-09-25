@@ -1,4 +1,5 @@
 import asyncio
+from decimal import ROUND_CEILING, ROUND_FLOOR
 from time import perf_counter
 from uuid import uuid4
 
@@ -20,6 +21,7 @@ from app.models import (
     PositionEvent,
     TradeIntent,
 )
+from app.trading.safety import SafetyService
 
 
 class PaperExchange:
@@ -40,7 +42,18 @@ class PaperExchange:
         existing = self.session.scalar(select(Order).where(Order.client_order_id == client_order_id))
         if existing:
             return {"order_id": existing.id, "position_id": existing.position_id, "idempotent": True}
+        # Defense in depth: Risk already rejects under a kill switch; the venue refuses too.
+        halted = SafetyService(self.session).blocks_new_orders(None, plan.symbol)
+        if halted:
+            raise SafetyError(f"New paper orders are halted: {', '.join(halted)}")
         validation_price = decimal(plan.limit_price or plan.stop_price or market_price)
+        if plan.order_type == "MARKET":
+            # A market order has no price of its own; it fills on the venue's tick grid, so the
+            # observed reference price is aligned to that grid before instrument validation.
+            reference = AssetRegistryService(self.session).instrument("paper", plan.symbol)
+            if reference and decimal(reference.tick_size) > ZERO:
+                tick = decimal(reference.tick_size)
+                validation_price = (validation_price / tick).to_integral_value() * tick
         validation = AssetRegistryService(self.session).validate_order(
             "paper", plan.symbol, decimal(plan.quantity), validation_price
         )
@@ -143,8 +156,16 @@ class PaperExchange:
         fill_quantity = quantity(remaining * ratio)
         if fill_quantity <= ZERO:
             return {"order_id": order.id, "position_id": order.position_id, "idempotent": True}
-        slippage = decimal(self.settings.paper_slippage_rate) * (ONE if plan.side == "BUY" else -ONE)
+        adverse = decimal(self.settings.paper_slippage_rate) + decimal(self.settings.paper_spread_bps) / 20_000
+        slippage = adverse * (ONE if plan.side == "BUY" else -ONE)
         fill_price = price(decimal(market_price) * (ONE + slippage))
+        instrument = AssetRegistryService(self.session).instrument("paper", plan.symbol)
+        if instrument and decimal(instrument.tick_size) > ZERO:
+            # Fills land on the venue's tick grid, rounded against the trader.
+            tick = decimal(instrument.tick_size)
+            steps = fill_price / tick
+            steps = steps.to_integral_value(rounding=ROUND_CEILING if plan.side == "BUY" else ROUND_FLOOR)
+            fill_price = price(steps * tick)
         fee = money(fill_quantity * fill_price * decimal(self.settings.paper_fee_rate))
         previous_fill = decimal(order.fill_quantity)
         total_fill = quantity(previous_fill + fill_quantity)
@@ -176,6 +197,7 @@ class PaperExchange:
             position = Position(
                 strategy_version_id=intent.strategy_version_id, symbol=plan.symbol, side=plan.side,
                 quantity=fill_quantity, entry_price=fill_price, current_price=fill_price,
+                highest_price=fill_price, lowest_price=fill_price,
                 stop_loss=plan.stop_loss, take_profit=plan.take_profit, status="OPEN", fees=fee,
             )
             self.session.add(position)
@@ -207,6 +229,11 @@ class PaperExchange:
             await publish_persisted(
                 self.session, self.event_bus, Event("PositionOpened", {"position_id": position.id}, correlation_id), "positions"
             )
+            await publish_persisted(self.session, self.event_bus, Event("TRADE_OPENED", {
+                "position_id": position.id, "symbol": plan.symbol, "side": plan.side,
+                "strategy_version_id": intent.strategy_version_id, "decision_id": intent.decision_id,
+                "execution_plan_id": plan.id, "order_id": order.id, "price": str(fill_price),
+            }, correlation_id, source="paper_exchange"), "positions")
         return {"order_id": order.id, "position_id": position.id, "idempotent": False}
 
     def _report(self, order: Order, started: float) -> None:

@@ -1,9 +1,19 @@
+from decimal import Decimal
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.decimal_math import ZERO, decimal, money, price, quantity, rate
 from app.core.time import TimeService
 from app.models import PortfolioSnapshot, Position, PositionEvent
+
+
+def track_extremes(position: Position, mark_price) -> None:
+    """Maintain the high/low seen while open (input to MAE/MFE in trade memory)."""
+    if position.highest_price is None or mark_price > decimal(position.highest_price):
+        position.highest_price = mark_price
+    if position.lowest_price is None or mark_price < decimal(position.lowest_price):
+        position.lowest_price = mark_price
 
 
 class PositionManager:
@@ -32,13 +42,14 @@ class PositionManager:
             drawdown=latest.drawdown,
         ))
 
-    def mark(self, position: Position, price_value: float) -> Position:
+    def mark(self, position: Position, price_value: float | Decimal) -> Position:
         if position.status not in {"OPEN", "MANAGING"}:
             raise ValueError("Only open positions can be managed")
         previous = position.status
         position.status = "MANAGING"
         mark_price = price(price_value)
         position.current_price = mark_price
+        track_extremes(position, mark_price)
         direction = 1 if position.side == "BUY" else -1
         position.unrealized_pnl = money(
             (mark_price - decimal(position.entry_price)) * decimal(position.quantity) * direction
@@ -62,7 +73,9 @@ class PositionManager:
         self.session.commit()
         return position
 
-    def partial_close(self, position: Position, close_quantity: float, price_value: float, reason: str) -> Position:
+    def partial_close(
+        self, position: Position, close_quantity: float | Decimal, price_value: float | Decimal, reason: str,
+    ) -> Position:
         if position.status not in {"OPEN", "MANAGING"}:
             raise ValueError("Position is not closable")
         amount = quantity(close_quantity)
@@ -90,7 +103,7 @@ class PositionManager:
         self.session.commit()
         return position
 
-    def close(self, position: Position, price_value: float, reason: str) -> Position:
+    def close(self, position: Position, price_value: float | Decimal, reason: str) -> Position:
         if position.status not in {"OPEN", "MANAGING"}:
             raise ValueError("Position is not closable")
         previous = position.status

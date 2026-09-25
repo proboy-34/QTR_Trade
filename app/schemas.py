@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any
+from typing import Annotated, Any
 
 from pydantic import BaseModel, Field
 
@@ -151,3 +151,4 @@ class LivePaperStart(BaseModel):
     provider: str = "binance"
     symbol: str = Field("BTCUSDT", pattern=r"^[A-Z0-9]{5,20}$")
     timeframe: str = Field("1h", pattern=r"^(1m|5m|15m|1h|4h|1d)$")
+    symbols: list[Annotated[str, Field(pattern=r"^[A-Za-z0-9]{5,20}$")]] = Field(default_factory=list, max_length=50)

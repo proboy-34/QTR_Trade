@@ -2,7 +2,7 @@ import asyncio
 import json
 import math
 from collections.abc import AsyncIterator, Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
@@ -24,6 +24,7 @@ from app.global_services.historical import (
     HistoricalBackfillService,
 )
 from app.global_services.market_data import MarketDataQuality
+from app.global_services.regime import RegimeService
 from app.models import (
     Dataset,
     LivePaperSession,
@@ -32,6 +33,7 @@ from app.models import (
 )
 from app.trading.loop import PaperTradingLoop
 from app.trading.pipeline import MarketSnapshot
+from app.trading.safety import SafetyService
 
 
 class LiveCandleStream(Protocol):
@@ -41,7 +43,9 @@ class LiveCandleStream(Protocol):
 class BinanceKlineStream:
     """Public Binance Spot kline stream. It never authenticates or submits orders."""
 
-    base_url = "wss://stream.binance.com:9443/ws"
+    def __init__(self, base_url: str = "wss://stream.binance.com:9443") -> None:
+        self.root = base_url.rstrip("/")
+        self.base_url = f"{self.root}/ws"
 
     async def messages(self, symbol: str, timeframe: str) -> AsyncIterator[dict[str, Any]]:
         stream = f"{symbol.lower()}@kline_{timeframe}"
@@ -52,6 +56,17 @@ class BinanceKlineStream:
             async for raw in websocket:
                 payload = json.loads(raw)
                 yield self.normalize(payload)
+
+    async def messages_multi(self, symbols: list[str], timeframe: str) -> AsyncIterator[dict[str, Any]]:
+        """Combined stream for many symbols over one connection (Binance limit: 1024 streams)."""
+        streams = "/".join(f"{symbol.lower()}@kline_{timeframe}" for symbol in symbols)
+        async with connect(
+            f"{self.root}/stream?streams={streams}", ping_interval=20, ping_timeout=20,
+            close_timeout=10, max_queue=5000,
+        ) as websocket:
+            async for raw in websocket:
+                payload = json.loads(raw)
+                yield self.normalize(payload.get("data", payload))
 
     @staticmethod
     def normalize(payload: dict[str, Any]) -> dict[str, Any]:
@@ -87,6 +102,8 @@ class LivePaperState:
     last_decision: str | None = None
     last_error: str | None = None
     session_id: str | None = None
+    symbols: list[str] = field(default_factory=list)
+    prices: dict[str, str] = field(default_factory=dict)
 
 
 class LivePaperService:
@@ -102,7 +119,7 @@ class LivePaperService:
         self.session_factory = session_factory
         self.settings = settings
         self.event_bus = event_bus
-        self.stream = stream or BinanceKlineStream()
+        self.stream = stream or BinanceKlineStream(settings.binance_ws_base_url)
         self.state = LivePaperState(
             provider=settings.live_paper_provider,
             symbol=settings.live_paper_symbol,
@@ -138,7 +155,11 @@ class LivePaperService:
             session.commit()
             return len(identifiers)
 
-    async def start(self, provider: str, symbol: str, timeframe: str) -> dict[str, Any]:
+    async def start(
+        self, provider: str, symbol: str, timeframe: str, symbols: list[str] | None = None,
+    ) -> dict[str, Any]:
+        markets = list(dict.fromkeys(item.upper() for item in (symbols or [symbol]) if item))
+        symbol = markets[0]
         async with self._lock:
             if self.settings.trading_mode != "paper":
                 raise SafetyError("Live-data paper service requires TRADING_MODE=paper")
@@ -147,8 +168,8 @@ class LivePaperService:
             if timeframe not in TIMEFRAME_DELTA:
                 raise SafetyError("Unsupported live-paper timeframe")
             if self._task and not self._task.done():
-                if (provider, symbol, timeframe) == (
-                    self.state.provider, self.state.symbol, self.state.timeframe,
+                if (provider, markets, timeframe) == (
+                    self.state.provider, self.state.symbols or [self.state.symbol], self.state.timeframe,
                 ):
                     return self.snapshot()
                 raise SafetyError("Stop the running live-paper session before changing its market")
@@ -160,6 +181,7 @@ class LivePaperService:
                     configuration={
                         "paper_only": True,
                         "bootstrap_candles": self.settings.live_paper_bootstrap_candles,
+                        "symbols": markets,
                     },
                 )
                 session.add(record)
@@ -168,7 +190,7 @@ class LivePaperService:
                 session_id = record.id
             self.state = LivePaperState(
                 status="STARTING", provider=provider, symbol=symbol, timeframe=timeframe,
-                started_at=now, session_id=session_id,
+                started_at=now, session_id=session_id, symbols=markets,
             )
             self._desired = True
             self._task = asyncio.create_task(self._supervise(), name="qtr-live-paper")
@@ -198,7 +220,13 @@ class LivePaperService:
                     self.state.status = "CONNECTING"
                     self.state.connected = False
                     self._update_record(status="CONNECTING")
-                    async for candle in self.stream.messages(self.state.symbol, self.state.timeframe):
+                    markets = self.state.symbols or [self.state.symbol]
+                    multi = getattr(self.stream, "messages_multi", None)
+                    source = (
+                        multi(markets, self.state.timeframe) if len(markets) > 1 and multi
+                        else self.stream.messages(self.state.symbol, self.state.timeframe)
+                    )
+                    async for candle in source:
                         if not self._desired:
                             break
                         first_message = not self.state.connected
@@ -206,7 +234,10 @@ class LivePaperService:
                         self.state.status = "LIVE"
                         self.state.last_error = None
                         self.state.last_message_at = candle.get("observed_at") or TimeService.now()
-                        self.state.latest_price = str(candle["close"])
+                        candle_symbol = str(candle.get("symbol") or self.state.symbol).upper()
+                        self.state.prices[candle_symbol] = str(candle["close"])
+                        if candle_symbol == self.state.symbol:
+                            self.state.latest_price = str(candle["close"])
                         if first_message:
                             event_type = "ExchangeReconnected" if self.state.reconnects else "LivePaperConnected"
                             await self._publish(event_type, {
@@ -214,7 +245,7 @@ class LivePaperService:
                                 "symbol": self.state.symbol,
                                 "timeframe": self.state.timeframe,
                             })
-                        await self._monitor_price(float(candle["close"]))
+                        await self._monitor_price(float(candle["close"]), candle_symbol)
                         if candle.get("closed"):
                             await self.ingest_closed_candle(candle)
                     if self._desired:
@@ -247,10 +278,14 @@ class LivePaperService:
             self._update_record(status="ERROR", last_error=self.state.last_error)
 
     async def _bootstrap(self) -> None:
+        for symbol in self.state.symbols or [self.state.symbol]:
+            await self._bootstrap_symbol(symbol)
+
+    async def _bootstrap_symbol(self, symbol: str) -> None:
         with self.session_factory() as session:
             count = session.scalar(select(func.count()).select_from(MarketCandle).where(
                 MarketCandle.exchange == self.state.provider,
-                MarketCandle.symbol == self.state.symbol,
+                MarketCandle.symbol == symbol,
                 MarketCandle.timeframe == self.state.timeframe,
             )) or 0
         if count >= 35:
@@ -265,15 +300,16 @@ class LivePaperService:
             start = datetime.fromtimestamp(start_ms / 1000, UTC)
             end = datetime.fromtimestamp(end_ms / 1000, UTC)
             job = HistoricalBackfillService(session).create(
-                self.state.provider, self.state.symbol, self.state.timeframe,
+                self.state.provider, symbol, self.state.timeframe,
                 start, end, min(500, self.settings.live_paper_bootstrap_candles),
             )
             provider = HISTORICAL_PROVIDERS[self.state.provider]
             await HistoricalBackfillService(session).run(job, provider)
             if job.status != "COMPLETED":
-                raise ConnectionError(f"Historical warm-up failed: {job.failure_reason}")
+                raise ConnectionError(f"Historical warm-up failed for {symbol}: {job.failure_reason}")
 
     async def ingest_closed_candle(self, candle: dict[str, Any]) -> bool:
+        symbol = str(candle.get("symbol") or self.state.symbol).upper()
         timestamp = candle["timestamp"]
         if isinstance(timestamp, str):
             timestamp = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
@@ -287,38 +323,61 @@ class LivePaperService:
             ),
         )
         with self.session_factory() as session:
-            if not report.valid:
+            errors = list(report.errors)
+            previous_close = session.scalar(select(MarketCandle.close).where(
+                MarketCandle.exchange == self.state.provider, MarketCandle.symbol == symbol,
+                MarketCandle.timeframe == self.state.timeframe, MarketCandle.timestamp < timestamp,
+            ).order_by(desc(MarketCandle.timestamp)))
+            if report.valid and previous_close and decimal(previous_close) > 0:
+                jump = abs(decimal(candle["close"]) / decimal(previous_close) - 1) * 100
+                if jump > decimal(self.settings.safety_max_price_jump_pct):
+                    errors.append("IMPOSSIBLE_PRICE_JUMP")
+                    control, created = SafetyService(session).activate(
+                        "ASSET", f"{symbol} close moved {jump:.2f}% in one candle", target=symbol,
+                        trigger="IMPOSSIBLE_PRICE", source="automatic",
+                        details={"previous_close": str(previous_close), "close": str(candle["close"])},
+                    )
+                    if created:
+                        await publish_persisted(session, self.event_bus, Event("SAFE_MODE_TRIGGERED", {
+                            "control_id": control.id, "scope": "ASSET", "target": symbol,
+                            "trigger": "IMPOSSIBLE_PRICE", "message": control.reason,
+                        }, source="live_paper_service"), "safety")
+            if errors:
                 session.add(MarketDataValidationFailure(
-                    exchange=self.state.provider, symbol=self.state.symbol,
-                    timestamp=timestamp, error_codes=report.errors,
+                    exchange=self.state.provider, symbol=symbol,
+                    timestamp=timestamp, error_codes=errors,
                     payload={key: str(value) for key, value in candle.items()},
                 ))
                 session.commit()
-                self.state.last_error = ",".join(report.errors)
+                self.state.last_error = ",".join(errors)
                 return False
             existing = session.scalar(select(MarketCandle.id).where(
                 MarketCandle.exchange == self.state.provider,
-                MarketCandle.symbol == self.state.symbol,
+                MarketCandle.symbol == symbol,
                 MarketCandle.timeframe == self.state.timeframe,
                 MarketCandle.timestamp == timestamp,
             ))
             if existing:
                 return False
             session.add(MarketCandle(
-                exchange=self.state.provider, symbol=self.state.symbol,
+                exchange=self.state.provider, symbol=symbol,
                 timeframe=self.state.timeframe, timestamp=timestamp,
                 open=decimal(candle["open"]), high=decimal(candle["high"]),
                 low=decimal(candle["low"]), close=decimal(candle["close"]),
                 volume=decimal(candle["volume"]), is_demo=False,
             ))
+            await publish_persisted(session, self.event_bus, Event("CANDLE_CLOSED", {
+                "exchange": self.state.provider, "symbol": symbol, "timeframe": self.state.timeframe,
+                "candle_timestamp": timestamp.isoformat(), "close": str(candle["close"]),
+            }, source="live_paper_service"), "market_data")
             session.commit()
             self.state.candles_received += 1
             self.state.last_candle_at = timestamp
-            result = await self._evaluate_latest(session, observed_at)
+            result = await self._evaluate_latest(session, observed_at, symbol)
             if result:
                 self.state.decisions_run += 1
-                self.state.last_decision = result.get("outcome")
-            self._update_dataset(session, timestamp)
+                self.state.last_decision = (result.get("decision") or {}).get("outcome")
+            self._update_dataset(session, timestamp, symbol)
             session.commit()
         self._update_record(
             status="LIVE", last_message_at=self.state.last_message_at,
@@ -327,12 +386,13 @@ class LivePaperService:
         )
         return True
 
-    async def _evaluate_latest(self, session: Session, observed_at: datetime) -> dict | None:
+    async def _evaluate_latest(self, session: Session, observed_at: datetime, symbol: str | None = None) -> dict | None:
+        symbol = symbol or self.state.symbol
         rows = session.scalars(select(MarketCandle).where(
             MarketCandle.exchange == self.state.provider,
-            MarketCandle.symbol == self.state.symbol,
+            MarketCandle.symbol == symbol,
             MarketCandle.timeframe == self.state.timeframe,
-        ).order_by(desc(MarketCandle.timestamp)).limit(250)).all()
+        ).order_by(desc(MarketCandle.timestamp)).limit(300)).all()
         if len(rows) < 35:
             self.state.status = "WARMING_UP"
             return None
@@ -347,27 +407,29 @@ class LivePaperService:
         volatility = float(latest["volatility"])
         if not math.isfinite(volatility):
             volatility = 0.0
+        _, regime = RegimeService(session).update(self.state.provider, symbol, self.state.timeframe, frame)
         snapshot = MarketSnapshot(
-            symbol=self.state.symbol, price=float(latest["close"]),
+            symbol=symbol, price=float(latest["close"]),
             volume=float(latest["volume"]), volatility=volatility, funding=0,
             regime=str(latest["regime"]).upper(), direction=str(latest["trend"]).upper(),
             observed_at=observed_at, exchange=self.state.provider,
-            timeframe=self.state.timeframe,
+            timeframe=self.state.timeframe, market_regime=regime.regime,
         )
         return await PaperTradingLoop(session, self.settings, self.event_bus).process(snapshot)
 
-    async def _monitor_price(self, price_value: float) -> None:
+    async def _monitor_price(self, price_value: float, symbol: str | None = None) -> None:
         with self.session_factory() as session:
             await PaperTradingLoop(session, self.settings, self.event_bus).monitor_price(
-                self.state.symbol, price_value
+                symbol or self.state.symbol, price_value
             )
 
-    def _update_dataset(self, session: Session, timestamp: datetime) -> None:
-        name = f"{self.state.provider}:{self.state.symbol}:{self.state.timeframe}:live"
+    def _update_dataset(self, session: Session, timestamp: datetime, symbol: str | None = None) -> None:
+        symbol = symbol or self.state.symbol
+        name = f"{self.state.provider}:{symbol}:{self.state.timeframe}:live"
         dataset = session.scalar(select(Dataset).where(Dataset.name == name))
         count = session.scalar(select(func.count()).select_from(MarketCandle).where(
             MarketCandle.exchange == self.state.provider,
-            MarketCandle.symbol == self.state.symbol,
+            MarketCandle.symbol == symbol,
             MarketCandle.timeframe == self.state.timeframe,
         )) or 0
         if dataset:
@@ -375,7 +437,7 @@ class LivePaperService:
             dataset.freshness_at = timestamp
         else:
             session.add(Dataset(
-                name=name, symbol=self.state.symbol, timeframe=self.state.timeframe,
+                name=name, symbol=symbol, timeframe=self.state.timeframe,
                 source=f"{self.state.provider}-live", row_count=count,
                 freshness_at=timestamp, is_demo=False,
             ))

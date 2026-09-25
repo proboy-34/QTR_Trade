@@ -292,9 +292,28 @@ async def test_paper_loop_marks_and_closes_existing_position_at_target(session):
     )
     session.add(position)
     session.commit()
-    result = await PaperTradingLoop(session, Settings(), EventBus()).process(MarketSnapshot(
+    # Frictionless configuration: exit fills exactly at the observed mark.
+    frictionless = Settings(paper_slippage_rate=0, paper_spread_bps=0)
+    result = await PaperTradingLoop(session, frictionless, EventBus()).process(MarketSnapshot(
         "BTCUSDT", 111, 100, .2, 0, "sideways", "NEUTRAL"
     ))
     assert result["closed_positions"] == [position.id]
     assert position.status == "CLOSED" and position.exit_reason == "take_profit"
     assert position.realized_pnl == Decimal("11.0000000000")
+
+
+@pytest.mark.asyncio
+async def test_paper_exit_applies_slippage_and_half_spread_against_the_position(session):
+    portfolio(session)
+    position = Position(
+        strategy_version_id="version", symbol="BTCUSDT", side="BUY", quantity=1,
+        entry_price=100, current_price=100, stop_loss=95, take_profit=110, status="OPEN",
+    )
+    session.add(position)
+    session.commit()
+    settings = Settings(paper_slippage_rate=0.001, paper_spread_bps=20)
+    await PaperTradingLoop(session, settings, EventBus()).monitor_price("BTCUSDT", 90)
+    # Gap through the 95 stop: fill at the observed 90 minus 0.1% slippage and 0.1% half-spread.
+    assert position.status == "CLOSED" and position.exit_reason == "stop_loss"
+    assert position.current_price == Decimal("89.820000000000")
+    assert position.realized_pnl == Decimal("-10.1800000000")

@@ -32,18 +32,21 @@ class TaskOrchestrator:
         self._tasks: list[asyncio.Task] = []
         self._stopping = asyncio.Event()
 
-    def schedule(self, name: str, interval_seconds: int, job: Job) -> None:
+    def schedule(self, name: str, interval_seconds: int, job: Job, initial_delay: float | None = None) -> None:
         if name in self.states:
             raise ValueError(f"Job already registered: {name}")
+        first = interval_seconds if initial_delay is None else initial_delay
         self.states[name] = JobState(name, interval_seconds)
-        self.states[name].next_run = TimeService.now() + timedelta(seconds=interval_seconds)
-        self._tasks.append(asyncio.create_task(self._run(self.states[name], job)))
+        self.states[name].next_run = TimeService.now() + timedelta(seconds=first)
+        self._tasks.append(asyncio.create_task(self._run(self.states[name], job, first)))
 
-    async def _run(self, state: JobState, job: Job) -> None:
+    async def _run(self, state: JobState, job: Job, first_delay: float | None = None) -> None:
+        delay = state.interval_seconds if first_delay is None else first_delay
         while not self._stopping.is_set():
             try:
-                await asyncio.wait_for(self._stopping.wait(), timeout=state.interval_seconds)
+                await asyncio.wait_for(self._stopping.wait(), timeout=delay)
             except TimeoutError:
+                delay = state.interval_seconds
                 if not state.enabled:
                     state.status = "DISABLED"
                     continue

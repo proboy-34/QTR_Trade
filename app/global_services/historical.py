@@ -28,8 +28,11 @@ class HistoricalCandleProvider(Protocol):
 class BinanceHistoricalProvider:
     name = "binance"
 
+    def __init__(self, base_url: str = "https://api.binance.com") -> None:
+        self.base_url = base_url
+
     async def fetch_batch(self, symbol: str, timeframe: str, start: datetime, end: datetime, limit: int) -> list[dict]:
-        async with httpx.AsyncClient(base_url="https://api.binance.com", timeout=15) as client:
+        async with httpx.AsyncClient(base_url=self.base_url, timeout=15) as client:
             response = await client.get("/api/v3/klines", params={
                 "symbol": symbol, "interval": timeframe,
                 "startTime": int(start.timestamp() * 1000), "endTime": int(end.timestamp() * 1000),

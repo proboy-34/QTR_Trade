@@ -12,6 +12,7 @@ Requires-Dist: httpx<1,>=0.28
 Requires-Dist: numpy<3,>=2.1
 Requires-Dist: pandas<3,>=2.2
 Requires-Dist: python-multipart<1,>=0.0.20
+Requires-Dist: websockets<18,>=13
 Provides-Extra: postgres
 Requires-Dist: psycopg[binary]<4,>=3.2; extra == "postgres"
 Provides-Extra: dev

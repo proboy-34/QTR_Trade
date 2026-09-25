@@ -5,13 +5,13 @@ from typing import Any
 import pandas as pd
 from fastapi import APIRouter, Depends, Query, WebSocket
 from sqlalchemy import desc, func, select
-from sqlalchemy.inspection import inspect
 from sqlalchemy.orm import Session
 
-from app.core.auth import Principal, local_principal
+from app.core.auth import Principal, Role, local_principal, require
 from app.core.config import get_settings
 from app.core.errors import NotFoundError, QTRError
 from app.core.events import Event, EventBus, publish_persisted
+from app.core.serialization import serialize
 from app.db import SessionLocal, get_db
 from app.global_services.assets import AssetRegistryService
 from app.global_services.backtest import BacktestEngine
@@ -23,6 +23,7 @@ from app.global_services.live_paper import LivePaperService
 from app.global_services.market_intelligence import is_high_impact
 from app.global_services.strategy_repository import StrategyRepository
 from app.global_services.validation import WalkForwardConfig, WalkForwardValidator
+from app.memory.trade_memory import TradeMemoryService
 from app.models import (
     Asset,
     AssetInstrument,
@@ -87,10 +88,6 @@ connection_manager = ConnectionManager(event_bus)
 live_paper_service = LivePaperService(SessionLocal, get_settings(), event_bus)
 
 
-def serialize(obj: Any) -> dict[str, Any]:
-    return {column.key: getattr(obj, column.key) for column in inspect(obj).mapper.column_attrs}
-
-
 def candle_frame(rows: Sequence[Any]) -> pd.DataFrame:
     frame = pd.DataFrame([serialize(row) for row in rows])
     for column in ("open", "high", "low", "close", "volume", "funding_rate", "open_interest"):
@@ -106,7 +103,7 @@ def page(session: Session, model: Any, page_number: int, page_size: int, *criter
         query, count_query = query.where(*criteria), count_query.where(*criteria)
     if hasattr(model, "created_at"):
         query = query.order_by(desc(model.created_at))
-    items = session.scalars(query.offset((page_number - 1) * page_size).limit(page_size)).all()
+    items: Sequence[Any] = session.scalars(query.offset((page_number - 1) * page_size).limit(page_size)).all()
     return {"items": [serialize(item) for item in items], "total": session.scalar(count_query) or 0, "page": page_number, "page_size": page_size}
 
 
@@ -260,7 +257,10 @@ def add_version(strategy_id: str, payload: StrategyVersionCreate, session: Sessi
 
 
 @router.post("/strategies/{strategy_id}/transition")
-def transition_strategy(strategy_id: str, payload: TransitionRequest, session: Session = Depends(get_db)) -> dict:
+def transition_strategy(
+    strategy_id: str, payload: TransitionRequest, session: Session = Depends(get_db),
+    _: Principal = Depends(require(Role.TRADER)),
+) -> dict:
     return serialize(StrategyRepository(session).transition(strategy_id, payload.status, payload.reason))
 
 
@@ -495,7 +495,8 @@ def positions(session: Session = Depends(get_db)) -> dict: return page(session, 
 
 @router.post("/positions/{position_id}/actions")
 def position_action(
-    position_id: str, payload: PositionAction, session: Session = Depends(get_db)
+    position_id: str, payload: PositionAction, session: Session = Depends(get_db),
+    _: Principal = Depends(require(Role.TRADER)),
 ) -> dict:
     position = session.get(Position, position_id)
     if not position:
@@ -510,6 +511,8 @@ def position_action(
         manager.partial_close(position, payload.quantity, payload.price, payload.reason)
     elif action == "CLOSE" and payload.price:
         manager.close(position, payload.price, payload.reason)
+        TradeMemoryService(session).record(position)
+        session.commit()
     else:
         raise QTRError("Invalid position action or missing price")
     return serialize(position)
@@ -618,14 +621,15 @@ def live_paper_status() -> dict:
 
 
 @router.post("/live-paper/start", status_code=202)
-async def start_live_paper(payload: LivePaperStart) -> dict:
+async def start_live_paper(payload: LivePaperStart, _: Principal = Depends(require(Role.TRADER))) -> dict:
     return await live_paper_service.start(
-        payload.provider, payload.symbol.upper(), payload.timeframe
+        payload.provider, payload.symbol.upper(), payload.timeframe,
+        [item.upper() for item in payload.symbols] or None,
     )
 
 
 @router.post("/live-paper/stop")
-async def stop_live_paper() -> dict:
+async def stop_live_paper(_: Principal = Depends(require(Role.TRADER))) -> dict:
     return await live_paper_service.stop()
 
 

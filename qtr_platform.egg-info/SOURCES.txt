@@ -25,6 +25,7 @@ app/global_services/connections.py
 app/global_services/exchanges.py
 app/global_services/features.py
 app/global_services/historical.py
+app/global_services/live_paper.py
 app/global_services/market_data.py
 app/global_services/market_intelligence.py
 app/global_services/strategy_repository.py
@@ -52,6 +53,8 @@ tests/test_backtest.py
 tests/test_backtest_bias.py
 tests/test_core.py
 tests/test_features.py
+tests/test_hardening.py
+tests/test_live_paper.py
 tests/test_market_data_quality.py
 tests/test_pipeline.py
 tests/test_reconciliation_positions.py
