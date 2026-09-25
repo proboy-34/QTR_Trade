@@ -10,6 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.decimal_math import decimal, rate
+from app.core.time import TimeService
 from app.global_services.market_data import MarketDataQuality
 from app.models import MarketCandle, MarketDataBackfill, MarketDataValidationFailure
 
@@ -130,6 +131,11 @@ class HistoricalBackfillService:
         return job
 
     async def run(self, job: MarketDataBackfill, provider: HistoricalCandleProvider) -> MarketDataBackfill:
+        # SQLite returns naive datetimes; a naive value's .timestamp() would use the host's local
+        # timezone (e.g. on Windows), silently shifting provider request windows.
+        job.start_at = TimeService.ensure_utc(job.start_at)
+        job.end_at = TimeService.ensure_utc(job.end_at)
+        job.next_start_at = TimeService.ensure_utc(job.next_start_at)
         job.status = "RUNNING"
         job.failure_reason = None
         self.session.commit()

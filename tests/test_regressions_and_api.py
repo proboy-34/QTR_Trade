@@ -56,6 +56,34 @@ async def test_live_paper_reports_last_decision_outcome(session):
 
 
 @pytest.mark.asyncio
+async def test_backfill_resumed_from_database_handles_naive_sqlite_datetimes(tmp_path):
+    from datetime import UTC, datetime
+
+    from sqlalchemy import create_engine, func
+
+    from app.db import Base
+    from app.global_services.historical import (
+        HistoricalBackfillService,
+        SyntheticHistoricalProvider,
+    )
+    from app.models import MarketCandle, MarketDataBackfill
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'backfill.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    with factory() as first:
+        start = datetime(2026, 1, 1, tzinfo=UTC)
+        job_id = HistoricalBackfillService(first).create("paper", "ETHUSDT", "1h", start, datetime(2026, 1, 3, tzinfo=UTC), 10).id
+    with factory() as second:  # values now come back from SQLite without tzinfo
+        job = second.get(MarketDataBackfill, job_id)
+        assert job.next_start_at.tzinfo is None
+        await HistoricalBackfillService(second).run(job, SyntheticHistoricalProvider())
+        assert job.status == "COMPLETED" and job.rows_written == 49
+        assert second.scalar(select(func.min(MarketCandle.timestamp))) == datetime(2026, 1, 1)
+    engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_token_authentication_and_role_hierarchy():
     provider = StaticTokenAuthProvider("viewer-token:viewer,research-token:researcher,admin-token:admin")
     viewer = await provider.authenticate("Bearer viewer-token")
@@ -105,6 +133,8 @@ def test_autonomy_api_surface_and_safety_controls(monkeypatch, api_app):
                      "/api/v1/strategies/overview", "/api/v1/regimes"):
             assert path in schema, path
         assert client.get("/api/v1/universe").json()["run_id"] is None
+        overview = client.get("/api/v1/strategies/overview")
+        assert overview.status_code == 200 and overview.json()["items"] == []
         dashboard = client.get("/api/v1/research/dashboard").json()
         assert set(dashboard["counts"]) >= {"hypotheses", "experiments", "rejected", "paper_testing", "validated"}
         ai = client.get("/api/v1/ai/status").json()

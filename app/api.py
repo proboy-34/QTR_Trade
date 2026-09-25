@@ -111,7 +111,11 @@ def page(session: Session, model: Any, page_number: int, page_size: int, *criter
 def dashboard(session: Session = Depends(get_db)) -> dict:
     settings = get_settings()
     portfolio = session.scalar(select(PortfolioSnapshot).order_by(desc(PortfolioSnapshot.captured_at)))
-    latest_candle = session.scalar(select(MarketCandle).order_by(desc(MarketCandle.timestamp)))
+    # Prefer real (non-demo) data for the headline market; never mix symbols or exchanges.
+    latest_candle = session.scalar(
+        select(MarketCandle).where(MarketCandle.symbol == settings.default_symbol)
+        .order_by(MarketCandle.is_demo, desc(MarketCandle.timestamp))
+    ) or session.scalar(select(MarketCandle).order_by(MarketCandle.is_demo, desc(MarketCandle.timestamp)))
     latest_decision = session.scalar(select(Decision).order_by(desc(Decision.created_at)))
     active_strategies = session.scalar(select(func.count()).select_from(Strategy).where(Strategy.status == "active")) or 0
     return {

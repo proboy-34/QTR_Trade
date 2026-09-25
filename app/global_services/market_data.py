@@ -64,6 +64,8 @@ class MarketDataQuality:
             if missing_intervals:
                 warnings.append("MISSING_CANDLES")
         current = now or datetime.now(UTC)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=UTC)
         latest = timestamps.iloc[-1].to_pydatetime()
         if latest > current + timedelta(seconds=5):
             errors.append("FUTURE_TIMESTAMP")

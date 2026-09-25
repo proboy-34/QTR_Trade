@@ -133,8 +133,9 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
     allow_headers=["Authorization", "Content-Type"],
 )
-app.include_router(router)
+# Specific autonomy routes (e.g. /strategies/overview) must precede V1 path parameters.
 app.include_router(autonomy_router)
+app.include_router(router)
 
 
 @app.get("/health")

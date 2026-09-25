@@ -359,6 +359,7 @@ def strategies_overview(session: Session = Depends(get_db)) -> dict:
         items.append({
             **serialize(strategy), "version": version.version if version else None,
             "version_id": version.id if version else None,
+            "parameters": version.parameters if version else {},
             "validations": [{"method": item.method, "result": item.result, "created_at": item.created_at} for item in validations],
             "paper_performance": trade_statistics(list(trades)),
             "recent_performance": trade_statistics(list(trades[-20:])),

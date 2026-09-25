@@ -1,6 +1,19 @@
 # QTR — Quantitative Trading Research
 
-QTR is a modular-monolith research and paper-trading platform. It preserves the evidence chain from a research objective through a validated, versioned strategy to decision, risk approval, execution, fill, and position. V1 is deliberately safe: it starts in **paper trading**, runs without exchange credentials, and refuses live mode unless two independent server-side gates are set.
+QTR is a modular-monolith quantitative research and paper-trading platform. It observes an eligible multi-asset Binance universe, scans for unusual situations, records market/news context, researches and validates strategy hypotheses (with explicit overfitting safeguards), paper-trades validated candidates, remembers every decision and trade, and turns the accumulated evidence into new research — while real-money trading stays disabled. It preserves the evidence chain from a research objective through a validated, versioned strategy to decision, risk approval, execution, fill, and position. V1 is deliberately safe: it starts in **paper trading**, runs without exchange credentials, and refuses live mode unless two independent server-side gates are set.
+
+## Autonomous research loop (new)
+
+- **Multi-asset universe**: eligibility from live Binance exchange metadata (liquidity, spread, status, filters, data quality, abnormal moves) — no hard-coded coin list.
+- **Market scanner, regimes and memory**: signal detection, ranked/deduplicated opportunities (never trades), evidence-scored regimes with `UNKNOWN` when unclear, similarity search over market history.
+- **Market intelligence**: provider-neutral news/macro (CryptoPanic, Finnhub) as structured, source-verified events.
+- **AI researcher (Gemini)**: budgeted, rate-limited, audited; a hallucination firewall separates facts, interpretation and hypotheses; AI output becomes research artifacts, never orders.
+- **Research engine**: declarative strategy specs (no code execution), IS/OOS/walk-forward, parameter perturbation, cost stress, Monte Carlo, deflated Sharpe with trial counting, passive benchmark, challengers vs champions.
+- **Paper validation and human review**: candidates trade paper money; promotion is an operator decision.
+- **Learning**: immutable trade memory, decision lineage, post-trade analysis, counterfactuals, strategy decay detection, backtest-vs-paper discrepancy, queryable knowledge base.
+- **Portfolio intelligence and safety**: correlation/concentration/beta-aware sizing, and a persisted kill switch (system, paper trading, new orders, strategy, asset) with automatic safe mode.
+
+See [docs/AUTONOMOUS_TRADING_ROADMAP.md](docs/AUTONOMOUS_TRADING_ROADMAP.md) (current → next → future) and [docs/RESEARCH_AND_LEARNING.md](docs/RESEARCH_AND_LEARNING.md) (gates, memory, AI rules).
 
 ## What is included
 
@@ -36,6 +49,10 @@ npm run dev
 
 Open `http://localhost:5173`. API docs are at `http://localhost:8000/docs`.
 
+New screens: **Market overview**, **Opportunities**, **Intelligence**, **Research lab**, **Strategy health**, **Learning**, and **Safety & risk**. All figures come from the database; screens say "not configured" rather than inventing data when a provider or key is missing.
+
+With internet access the scheduler discovers the Binance universe, syncs candles, scans, researches and learns automatically. To try the research engine offline, backfill the synthetic `paper` provider (Market data → Historical backfills) and create a hypothesis in the Research lab with data source "paper".
+
 ## Docker / PostgreSQL
 
 ```bash
@@ -50,6 +67,8 @@ Open `http://localhost:5173`. The API container waits for PostgreSQL and exposes
 python -m pytest -q
 python -m ruff check app tests
 python -m mypy app --ignore-missing-imports
+python -m alembic upgrade head
+python -m alembic check
 cd frontend
 npm test -- --run
 npm run lint
@@ -77,6 +96,7 @@ External configuration is listed in [MANUAL_SETUP.md](MANUAL_SETUP.md).
 ## Honest V1 boundaries
 
 - No authenticated private exchange adapter is registered, so real orders cannot be sent.
-- Historical backfills support bounded, checkpointed Binance/OKX/Bybit acquisition plus deterministic demo history; macro/news events remain manual/provider-neutral.
-- A provider-neutral role model and local demo identity are included, but external authentication is not. Put the application behind an authenticated private network boundary before public or multi-user deployment.
+- Real-provider connectivity (Binance public endpoints, Gemini, news providers) could not be exercised from the build environment; adapters are covered by fixture-based tests and must be smoke-tested where the network and keys are available.
+- Historical backfills support bounded, checkpointed Binance/OKX/Bybit acquisition plus deterministic demo history; news/macro ingestion needs a configured provider key, otherwise events are operator-entered.
+- Roles (viewer, researcher, trader, admin), a local demo identity and static bearer tokens (`AUTH_MODE=token`) are included, but external authentication is not. Put the application behind an authenticated private network boundary before public or multi-user deployment.
 - SQLite is for local demo use. PostgreSQL is the production target for transactional concurrency and fixed-precision financial storage.

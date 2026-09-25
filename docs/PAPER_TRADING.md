@@ -25,5 +25,15 @@ Useful settings:
 - `PAPER_PARTIAL_FILL_RATIO`: deterministic first-fill fraction.
 - `PAPER_FEE_RATE`: fee charged on notional.
 - `PAPER_SLIPPAGE_RATE`: deterministic adverse fill adjustment.
+- `PAPER_SPREAD_BPS`: full bid/ask spread; half is paid on every entry and exit.
+
+## Realism added in the autonomous-research release
+
+- Market orders are validated at the tick-aligned price they will fill at (previously an off-grid reference price caused a rejection); fills are rounded onto the tick grid against the trader.
+- Protective exits pay slippage and half-spread; a gap through a stop fills at the observed (worse) price, never at the stop level.
+- The strategy's own declarative exit rule is applied on closed candles, matching research.
+- Risk honours a strategy's declared stop/target (validated in research) within hard bounds.
+- Every close writes an immutable trade-memory record (MAE/MFE, slippage vs decision price, regime, events, lineage) and publishes `TRADE_CLOSED`.
+- Research candidates in `paper_testing` are traded with paper money alongside operator-activated strategies; promotion to review requires paper validation.
 
 This simulator is for research and operational rehearsal. It does not reproduce queue position, venue-specific liquidation, or every matching-engine rule.
