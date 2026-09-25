@@ -81,9 +81,11 @@ async def test_job_runner_persists_outcomes_and_respects_system_stop(session):
     assert records["ok_job"].status == "COMPLETED" and isinstance(records["ok_job"].details["when"], str)
     assert records["broken_job"].status == "FAILED" and "provider down" in records["broken_job"].error
     registered = jobs(context)
-    assert {"market_scan", "research_queue", "learning", "safety_monitor", "news_ingestion", "universe_refresh"} <= set(registered)
+    assert {"market_scan", "research_queue", "learning", "safety_monitor", "news_ingestion", "universe_refresh",
+            "macro_ingestion", "provider_verification"} <= set(registered)
+    assert "testnet_reconciliation" not in registered  # only scheduled in testnet mode
     news = await run_job(context, "news_ingestion", registered["news_ingestion"][1])
-    assert "no news/macro provider configured" in news["skipped"]
+    assert news["skipped"] == "FINNHUB_API_KEY not configured"
     SafetyService(session).activate("SYSTEM", "maintenance")
     session.commit()
     assert (await run_job(context, "market_scan", registered["market_scan"][1]))["skipped"] == "SYSTEM_STOP"

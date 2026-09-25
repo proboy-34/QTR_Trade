@@ -258,6 +258,10 @@ class MarketEvent(Base, TimestampMixin):
     unit: Mapped[str | None] = mapped_column(String(20))
     country: Mapped[str | None] = mapped_column(String(20))
     raw_reference: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    # When the information became knowable. Decisions and research may only use events with
+    # available_at <= decision time (news: publication; macro: release time).
+    available_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    retrieved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     processing_status: Mapped[str] = mapped_column(String(30), default="NORMALIZED", index=True)
 
 
@@ -275,6 +279,8 @@ class Decision(Base):
     exchange: Mapped[str | None] = mapped_column(String(30))
     timeframe: Mapped[str | None] = mapped_column(String(10), index=True)
     lineage: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    # Structured trade decision: thesis, supporting/contradicting evidence, invalidation, plan, AI review.
+    rationale: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=TimeService.now)
 
 
@@ -332,6 +338,8 @@ class Position(Base, TimestampMixin):
     highest_price: Mapped[Decimal | None] = mapped_column(PRICE)
     lowest_price: Mapped[Decimal | None] = mapped_column(PRICE)
     status: Mapped[str] = mapped_column(String(20), default="OPEN", index=True)
+    # Execution venue: paper | testnet. Paper, testnet and live state are never mixed.
+    venue: Mapped[str] = mapped_column(String(20), default="paper", index=True)
     opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=TimeService.now)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
@@ -375,6 +383,7 @@ class PortfolioSnapshot(Base):
     margin_used: Mapped[Decimal] = mapped_column(MONEY)
     daily_pnl: Mapped[Decimal] = mapped_column(MONEY)
     drawdown: Mapped[Decimal] = mapped_column(RATE)
+    venue: Mapped[str] = mapped_column(String(20), default="paper", index=True)
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=TimeService.now, index=True)
 
 
@@ -568,6 +577,7 @@ class JobExecution(Base):
     status: Mapped[str] = mapped_column(String(20), index=True)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=TimeService.now)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    duration_ms: Mapped[int | None] = mapped_column(Integer)
     error: Mapped[str | None] = mapped_column(Text)
     details: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
@@ -798,3 +808,42 @@ class SafetyControl(Base):
     triggered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=TimeService.now, index=True)
     cleared_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     cleared_by: Mapped[str | None] = mapped_column(String(100))
+
+
+class ProviderCheck(Base):
+    """One real connectivity/capability check against an external provider. Never synthesized."""
+
+    __tablename__ = "provider_checks"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    run_id: Mapped[str] = mapped_column(String(36), index=True)
+    provider: Mapped[str] = mapped_column(String(30), index=True)
+    check: Mapped[str] = mapped_column(String(60))
+    endpoint: Mapped[str] = mapped_column(String(200))
+    required: Mapped[bool] = mapped_column(Boolean, default=True)
+    # OK | FAILED | NOT_CONFIGURED | NOT_AVAILABLE_ON_PLAN | SKIPPED
+    result: Mapped[str] = mapped_column(String(30), index=True)
+    http_status: Mapped[int | None] = mapped_column(Integer)
+    latency_ms: Mapped[int | None] = mapped_column(Integer)
+    detail: Mapped[str] = mapped_column(Text, default="")
+    data: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=TimeService.now, index=True)
+
+
+class MacroObservation(Base):
+    """Point-in-time macro value. available_at is when the value became public (vintage start)."""
+
+    __tablename__ = "macro_observations"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    source: Mapped[str] = mapped_column(String(30), default="fred", index=True)
+    series_id: Mapped[str] = mapped_column(String(40), index=True)
+    observation_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    value: Mapped[Decimal | None] = mapped_column(Numeric(30, 10))
+    realtime_start: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    realtime_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    retrieved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=TimeService.now)
+    units: Mapped[str | None] = mapped_column(String(80))
+    title: Mapped[str | None] = mapped_column(String(300))
+    __table_args__ = (
+        Index("ix_macro_vintage_unique", "source", "series_id", "observation_date", "realtime_start", unique=True),
+    )

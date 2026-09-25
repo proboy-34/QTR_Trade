@@ -1,11 +1,11 @@
 from decimal import Decimal
 
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.decimal_math import ZERO, decimal, money, price, quantity, rate
 from app.core.time import TimeService
 from app.models import PortfolioSnapshot, Position, PositionEvent
+from app.trading.accounts import latest_portfolio
 
 
 def track_extremes(position: Position, mark_price) -> None:
@@ -24,9 +24,7 @@ class PositionManager:
     def _portfolio_after_close(
         self, position: Position, close_quantity, exit_price, realized, fee
     ) -> None:
-        latest = self.session.scalar(
-            select(PortfolioSnapshot).order_by(PortfolioSnapshot.captured_at.desc())
-        )
+        latest = latest_portfolio(self.session, position.venue or "paper")
         if not latest:
             return
         equity_before = decimal(latest.equity)
@@ -34,6 +32,7 @@ class PositionManager:
         released = money(exit_price * close_quantity)
         exposure_reduction = entry_notional / max(equity_before, decimal(1))
         self.session.add(PortfolioSnapshot(
+            venue=position.venue or "paper",
             equity=money(equity_before + realized - fee),
             available_balance=money(decimal(latest.available_balance) + released - fee),
             exposure=rate(max(ZERO, decimal(latest.exposure) - exposure_reduction)),

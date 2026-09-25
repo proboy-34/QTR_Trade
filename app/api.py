@@ -12,17 +12,24 @@ from app.core.config import get_settings
 from app.core.errors import NotFoundError, QTRError
 from app.core.events import Event, EventBus, publish_persisted
 from app.core.serialization import serialize
+from app.core.time import TimeService
 from app.db import SessionLocal, get_db
 from app.global_services.assets import AssetRegistryService
 from app.global_services.backtest import BacktestEngine
 from app.global_services.connections import ConnectionManager
 from app.global_services.exchanges import EXCHANGES
 from app.global_services.features import enrich
-from app.global_services.historical import HISTORICAL_PROVIDERS, HistoricalBackfillService
+from app.global_services.historical import (
+    HISTORICAL_PROVIDERS,
+    TIMEFRAME_DELTA,
+    HistoricalBackfillService,
+)
 from app.global_services.live_paper import LivePaperService
 from app.global_services.market_intelligence import is_high_impact
 from app.global_services.strategy_repository import StrategyRepository
+from app.global_services.universe import liquidity_state
 from app.global_services.validation import WalkForwardConfig, WalkForwardValidator
+from app.integrations.health import PROVIDERS, ProviderVerifier, provider_health
 from app.memory.trade_memory import TradeMemoryService
 from app.models import (
     Asset,
@@ -33,7 +40,6 @@ from app.models import (
     Experiment,
     Fill,
     Hypothesis,
-    IntegrationMetadata,
     JobExecution,
     LivePaperSession,
     MarketCandle,
@@ -44,7 +50,6 @@ from app.models import (
     Observation,
     Opportunity,
     Order,
-    PortfolioSnapshot,
     Position,
     PositionEvent,
     ReconciliationIssue,
@@ -77,6 +82,8 @@ from app.schemas import (
     TransitionRequest,
     WalkForwardRequest,
 )
+from app.trading.accounts import latest_portfolio, venue_for
+from app.trading.loop import PaperTradingLoop
 from app.trading.pipeline import MarketSnapshot, TradingPipeline
 from app.trading.positions import PositionManager
 from app.trading.reconciliation import ExchangeState, ReconciliationService
@@ -110,7 +117,8 @@ def page(session: Session, model: Any, page_number: int, page_size: int, *criter
 @router.get("/dashboard")
 def dashboard(session: Session = Depends(get_db)) -> dict:
     settings = get_settings()
-    portfolio = session.scalar(select(PortfolioSnapshot).order_by(desc(PortfolioSnapshot.captured_at)))
+    venue = venue_for(settings) if venue_for(settings) != "none" else "paper"
+    portfolio = latest_portfolio(session, venue)
     # Prefer real (non-demo) data for the headline market; never mix symbols or exchanges.
     latest_candle = session.scalar(
         select(MarketCandle).where(MarketCandle.symbol == settings.default_symbol)
@@ -119,19 +127,20 @@ def dashboard(session: Session = Depends(get_db)) -> dict:
     latest_decision = session.scalar(select(Decision).order_by(desc(Decision.created_at)))
     active_strategies = session.scalar(select(func.count()).select_from(Strategy).where(Strategy.status == "active")) or 0
     return {
-        "system": {"status": "healthy", "trading_mode": settings.trading_mode, "database": "healthy", "event_bus": "healthy" if event_bus.healthy else "warning", "scheduler": "healthy", "demo_mode": settings.demo_mode},
+        "system": {"trading_mode": settings.trading_mode, "execution_mode": settings.execution_mode, "venue": venue,
+                   "data_mode": "DEMO" if settings.demo_mode else "REAL", "demo_mode": settings.demo_mode,
+                   "note": "component health is reported by /health (derived from real checks)"},
         "portfolio": serialize(portfolio) if portfolio else {},
         "market": serialize(latest_candle) if latest_candle else {},
         "counts": {
-            "open_positions": session.scalar(select(func.count()).select_from(Position).where(Position.status == "OPEN")) or 0,
-            "active_orders": session.scalar(select(func.count()).select_from(Order).where(Order.status.in_(["NEW", "PARTIALLY_FILLED"]))) or 0,
+            "open_positions": session.scalar(select(func.count()).select_from(Position).where(
+                Position.venue == venue, Position.status.in_(["OPEN", "MANAGING"]))) or 0,
+            "active_orders": session.scalar(select(func.count()).select_from(Order).where(
+                Order.exchange == venue, Order.status.in_(["NEW", "PARTIALLY_FILLED"]))) or 0,
             "active_strategies": active_strategies,
             "events": session.scalar(select(func.count()).select_from(SystemEvent)) or 0,
         },
         "latest_decision": serialize(latest_decision) if latest_decision else None,
-        "integrations": [
-            serialize(item) for item in session.scalars(select(IntegrationMetadata)).all()
-        ],
     }
 
 
@@ -367,6 +376,8 @@ def candles(
 def create_backfill(payload: BackfillCreate, session: Session = Depends(get_db)) -> dict:
     if payload.exchange not in HISTORICAL_PROVIDERS:
         raise QTRError("Historical provider is not supported")
+    if payload.exchange == "paper" and not get_settings().demo_mode:
+        raise QTRError("The synthetic 'paper' data provider is only available with DEMO_MODE=true")
     job = HistoricalBackfillService(session).create(
         payload.exchange, payload.symbol, payload.timeframe,
         payload.start_at, payload.end_at, payload.batch_limit,
@@ -406,9 +417,10 @@ def validation_failures(session: Session = Depends(get_db)) -> dict:
 
 @router.get("/market/context")
 def market_context(
-    symbol: str = "BTCUSDT", exchange: str = "paper", timeframe: str = "1h",
+    symbol: str = "BTCUSDT", exchange: str | None = None, timeframe: str = "1h",
     session: Session = Depends(get_db),
 ) -> dict:
+    exchange = exchange or ("paper" if get_settings().demo_mode else get_settings().scanner_exchange)
     rows = session.scalars(select(MarketCandle).where(
         MarketCandle.symbol == symbol,
         MarketCandle.exchange == exchange,
@@ -417,7 +429,10 @@ def market_context(
     if not rows: raise NotFoundError("No market data")
     frame = enrich(candle_frame(list(reversed(rows))))
     latest = frame.iloc[-1]
-    return {"symbol": symbol, "exchange": exchange, "timeframe": timeframe, "price": latest.close, "regime": latest.regime.upper(), "direction": latest.trend.upper(), "volatility": latest.volatility, "rsi": latest.rsi, "funding": latest.get("funding_rate", 0), "liquidity": "STRONG"}
+    return {"symbol": symbol, "exchange": exchange, "timeframe": timeframe, "price": latest.close,
+            "volume": latest.volume, "candle_at": rows[0].timestamp, "is_demo": rows[0].is_demo,
+            "regime": latest.regime.upper(), "direction": latest.trend.upper(), "volatility": latest.volatility,
+            "rsi": latest.rsi, "funding": latest.get("funding_rate", 0), "liquidity": liquidity_state(session, exchange, symbol)}
 
 
 @router.get("/market/live/{exchange}")
@@ -480,9 +495,40 @@ def opportunities(status: str | None = None, session: Session = Depends(get_db))
 
 
 @router.post("/decision/evaluate")
-async def evaluate(payload: MarketSnapshotInput, session: Session = Depends(get_db)) -> dict:
+async def evaluate(payload: MarketSnapshotInput, session: Session = Depends(get_db),
+                   _: Principal = Depends(require(Role.TRADER))) -> dict:
+    """Evaluate a caller-supplied snapshot. Caller-supplied prices are demo input: refused outside DEMO_MODE."""
+    if not get_settings().demo_mode:
+        raise QTRError("Caller-supplied market snapshots are only accepted in DEMO_MODE; use /decision/evaluate-latest")
     data = payload.model_dump(exclude={"force_signal"})
     return await TradingPipeline(session, get_settings(), event_bus).evaluate(MarketSnapshot(**data), payload.force_signal)
+
+
+@router.post("/decision/evaluate-latest")
+async def evaluate_latest(symbol: str = Query(..., pattern=r"^[A-Z0-9]{5,20}$"), timeframe: str = "1h",
+                          exchange: str | None = None, session: Session = Depends(get_db),
+                          _: Principal = Depends(require(Role.TRADER))) -> dict:
+    """Evaluate the latest stored closed candle. The server builds the snapshot; no client prices."""
+    settings = get_settings()
+    exchange = exchange or settings.scanner_exchange
+    if exchange == "paper" and not settings.demo_mode:
+        raise QTRError("Synthetic data cannot be evaluated outside DEMO_MODE")
+    rows = session.scalars(select(MarketCandle).where(
+        MarketCandle.exchange == exchange, MarketCandle.symbol == symbol, MarketCandle.timeframe == timeframe,
+    ).order_by(desc(MarketCandle.timestamp)).limit(300)).all()
+    if len(rows) < 35:
+        raise NotFoundError(f"Not enough stored {exchange} {symbol} {timeframe} candles to evaluate")
+    frame = enrich(candle_frame(list(reversed(rows))))
+    latest = frame.iloc[-1]
+    interval = TIMEFRAME_DELTA[timeframe]
+    snapshot = MarketSnapshot(
+        symbol=symbol, price=float(latest.close), volume=float(latest.volume),
+        volatility=float(latest.volatility) if pd.notna(latest.volatility) else 0.0, funding=0,
+        regime=str(latest.regime).upper(), direction=str(latest.trend).upper(),
+        liquidity=liquidity_state(session, exchange, symbol),
+        observed_at=TimeService.ensure_utc(rows[0].timestamp) + interval, exchange=exchange, timeframe=timeframe,
+    )
+    return await PaperTradingLoop(session, settings, event_bus).process(snapshot)
 
 
 @router.get("/decisions")
@@ -605,18 +651,19 @@ def auth_me(principal: Principal = Depends(local_principal)) -> dict:
 
 @router.get("/integrations")
 def integrations(session: Session = Depends(get_db)) -> list[dict]:
-    return [serialize(item) for item in session.scalars(select(IntegrationMetadata)).all()]
+    """Provider state from the latest real verification (never from configuration alone)."""
+    settings = get_settings()
+    return [{"provider": name, **provider_health(session, settings, name)} for name in PROVIDERS]
 
 
 @router.post("/integrations/{provider}/test")
-def test_integration(provider: str, session: Session = Depends(get_db)) -> dict:
-    item = session.scalar(select(IntegrationMetadata).where(IntegrationMetadata.provider == provider))
-    if not item: raise NotFoundError("Integration not found")
-    item.last_checked_at = datetime.now(UTC)
-    item.connection_status = "configured" if item.configured else "not_configured"
-    item.last_error = None if item.configured else "Credentials are not configured in the server environment"
-    session.commit()
-    return serialize(item)
+async def test_integration(provider: str, session: Session = Depends(get_db),
+                           _: Principal = Depends(require(Role.RESEARCHER))) -> dict:
+    """Run a real verification against the provider now and persist the result."""
+    if provider not in PROVIDERS:
+        raise NotFoundError("Unknown provider")
+    result = await ProviderVerifier(get_settings()).run(session, (provider,))
+    return {"provider": provider, **result["providers"][provider], "checked_at": result["checked_at"]}
 
 
 @router.get("/live-paper/status")
@@ -650,6 +697,10 @@ def public_settings() -> dict:
         "trading_mode": settings.trading_mode,
         "live_trading_enabled": settings.live_trading_enabled,
         "demo_mode": settings.demo_mode,
+        "data_mode": "DEMO" if settings.demo_mode else "REAL",
+        "execution_mode": settings.execution_mode,
+        "ai_trade_review": settings.ai_trade_review,
+        "gemini_model": settings.gemini_model,
         "live_paper": {
             "provider": settings.live_paper_provider,
             "symbol": settings.live_paper_symbol,

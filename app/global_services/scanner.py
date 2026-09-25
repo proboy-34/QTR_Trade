@@ -18,6 +18,7 @@ from app.core.config import Settings
 from app.core.events import Event, EventBus, publish_persisted
 from app.core.time import TimeService
 from app.global_services.features import enrich
+from app.global_services.market_intelligence import knowable_at
 from app.global_services.regime import RegimeService, load_candles
 from app.memory.market_memory import MarketMemoryService, context_features
 from app.models import (
@@ -232,8 +233,9 @@ class MarketScanner:
 
     def _events(self, symbol: str, at: datetime) -> tuple[list[MarketEvent], float]:
         base = symbol.removesuffix("USDT").removesuffix("USDC")
+        known = knowable_at()  # events published after the candle are not visible to it
         rows = self.session.scalars(select(MarketEvent).where(
-            MarketEvent.event_at >= at - timedelta(hours=24), MarketEvent.event_at <= at + timedelta(hours=24),
+            known >= at - timedelta(hours=24), known <= at,
         ).order_by(MarketEvent.event_at.desc()).limit(200)).all()
         related = [row for row in rows if base in (row.affected_assets or []) or symbol in (row.affected_assets or [])]
         relevance = max((float(row.relevance or 0) for row in related), default=0.0)

@@ -25,6 +25,7 @@ from app.global_services.historical import (
 )
 from app.global_services.market_data import MarketDataQuality
 from app.global_services.regime import RegimeService
+from app.global_services.universe import liquidity_state
 from app.models import (
     Dataset,
     LivePaperSession,
@@ -414,6 +415,7 @@ class LivePaperService:
             regime=str(latest["regime"]).upper(), direction=str(latest["trend"]).upper(),
             observed_at=observed_at, exchange=self.state.provider,
             timeframe=self.state.timeframe, market_regime=regime.regime,
+            liquidity=liquidity_state(session, self.state.provider, symbol),
         )
         return await PaperTradingLoop(session, self.settings, self.event_bus).process(snapshot)
 

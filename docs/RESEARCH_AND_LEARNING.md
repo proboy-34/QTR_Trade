@@ -97,3 +97,23 @@ hypotheses (or recorded rejections). Calls are budgeted (`AI_DAILY_BUDGET`,
 `AI_MONTHLY_BUDGET`, `AI_MAX_REQUESTS_PER_HOUR`), retried with backoff, cached for
 identical evidence, and logged with tokens, approximate cost, latency and errors.
 The AI is only called for high-ranked opportunities and new trades, never per tick.
+
+**Trade review.** With `AI_TRADE_REVIEW=advisory` (default) the AI reviews each TRADE proposal
+using only the recorded evidence and returns `SUPPORT`, `REJECT` or `UNCERTAIN` with reasons;
+the verdict is stored on the decision rationale. With `veto`, a `REJECT` turns the TRADE into
+NO TRADE. The AI can never create a trade, change a size, stop or target. If Gemini is not
+configured or fails, the review is recorded as `NOT_CONFIGURED` / `UNAVAILABLE` and the
+deterministic rules decide alone — no substitute text is generated.
+
+## Point-in-time data (no look-ahead)
+
+- Candles: signals use closed candles only; backtests fill on the next bar.
+- News/events: usable only once `knowable_at` (= `available_at`, else `published_at`, else
+  `event_at`) is at or before the decision time. Earlier versions allowed events up to one
+  hour (lineage) or 24 hours (scanner) *after* the decision; both were fixed.
+- Scheduled macro events are used as risk context only if the calendar entry was retrieved
+  before the decision.
+- FRED: each value is stored per vintage. A value first published on day D is treated as
+  available from D+1 00:00 UTC (release times are not provided by FRED), and revisions are only
+  visible from their own vintage date. `macro_as_of(t)` therefore never returns a later revision.
+- Regimes: the reasoner only reads regime records whose candle closed before the decision.

@@ -188,12 +188,30 @@ async def test_impossible_price_jump_is_rejected_and_halts_the_asset(session):
 def test_real_money_trading_is_disabled_and_no_live_order_path_exists():
     settings = Settings()
     assert settings.trading_mode == "paper" and not settings.live_trading_enabled
+    assert settings.execution_mode == "paper"
     with pytest.raises(ValueError):
         Settings(trading_mode="live")
+    with pytest.raises(ValueError):
+        Settings(execution_mode="live")  # LIVE is not an offered execution mode
     root = Path(__file__).resolve().parents[1] / "app"
-    source = "\n".join(path.read_text() for path in root.rglob("*.py"))
-    # No authenticated order endpoints or signed requests exist anywhere in the application.
-    for forbidden in ("/api/v3/order", "/sapi/", "/fapi/", "X-MBX-APIKEY", "hmac.new(", "/api/v5/trade", "/v5/order", "capital/withdraw", "wallet/transfer"):
-        assert forbidden not in source, forbidden
-    implementations = re.findall(r"class \w+\((?:[^)]*)PrivateExecutionAdapter", source)
+    files = {path.relative_to(root).as_posix(): path.read_text() for path in root.rglob("*.py")}
+    testnet, account = "execution/binance_testnet.py", "integrations/binance_account.py"
+    allowed = {
+        "hmac.new(": {testnet, account},
+        "X-MBX-APIKEY": {testnet, account},
+        "/api/v3/order": {testnet},
+        "/sapi/": {account},
+    }
+    for token, modules in allowed.items():
+        offenders = {name for name, text in files.items() if token in text} - modules
+        assert not offenders, f"{token} found outside reviewed modules: {offenders}"
+    for forbidden in ("/fapi/", "/api/v5/trade", "/v5/order", "capital/withdraw", "wallet/transfer", "/sapi/v1/asset/transfer"):
+        assert not [name for name, text in files.items() if forbidden in text], forbidden
+    # The testnet venue's host is a constant for the testnet and cannot point at the real exchange.
+    assert 'TESTNET_HOST = "https://testnet.binance.vision"' in files[testnet]
+    assert "api.binance.com" not in files[testnet] and "binance_public_base_url" not in files[testnet]
+    # Mainnet signed requests are GET-only and allowlisted.
+    assert 'READ_ONLY_ENDPOINTS = frozenset({("GET", "/api/v3/account"), ("GET", "/sapi/v1/account/apiRestrictions")})' in files[account]
+    assert "client.post" not in files[account] and "client.delete" not in files[account]
+    implementations = re.findall(r"class \w+\((?:[^)]*)PrivateExecutionAdapter", "\n".join(files.values()))
     assert implementations == []

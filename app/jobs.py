@@ -13,6 +13,7 @@ from app.ai.providers import build_provider
 from app.ai.research import AIResearchService
 from app.core.config import Settings
 from app.core.events import EventBus
+from app.core.logging import redact
 from app.core.time import TimeService
 from app.global_services.historical import (
     HISTORICAL_PROVIDERS,
@@ -24,6 +25,8 @@ from app.global_services.historical import (
 from app.global_services.market_intelligence import IntelligenceService, configured_providers
 from app.global_services.scanner import MarketScanner
 from app.global_services.universe import BinanceUniverseProvider, UniverseService
+from app.integrations.fred import MacroService
+from app.integrations.health import ProviderVerifier
 from app.learning.counterfactual import CounterfactualService
 from app.learning.post_trade import PostTradeAnalyst
 from app.learning.strategy_health import StrategyHealthService
@@ -36,6 +39,7 @@ from app.models import (
     Opportunity,
     Position,
     PostTradeAnalysis,
+    ProviderCheck,
     SystemEvent,
     TradeMemory,
 )
@@ -68,12 +72,13 @@ async def run_job(context: JobContext, name: str, job: Callable[[Session], Await
             status, error = "COMPLETED", None
         except Exception as exc:
             session.rollback()
-            details, status, error = {}, "FAILED", f"{type(exc).__name__}: {exc}"[:2000]
+            details, status, error = {}, "FAILED", redact(f"{type(exc).__name__}: {exc}", context.settings.secret_values())[:2000]
     with context.session_factory() as session:
         record = session.get(JobExecution, execution_id)
         if record:
             record.status, record.error, record.details = status, error, _jsonable(details)
             record.finished_at = TimeService.now()
+            record.duration_ms = max(0, round((record.finished_at - TimeService.ensure_utc(record.started_at)).total_seconds() * 1000))
         session.add(SystemEvent(
             type="ScheduledJobCompleted" if status == "COMPLETED" else "ScheduledJobFailed",
             component="orchestrator", severity="INFO" if status == "COMPLETED" else "WARNING",
@@ -157,13 +162,42 @@ def jobs(context: JobContext) -> dict[str, tuple[int, Callable[[Session], Awaita
         return results
 
     async def news_ingestion(session: Session) -> dict[str, Any]:
-        providers = configured_providers(settings)
+        providers = configured_providers(settings, session)
         if not providers:
-            return {"skipped": "no news/macro provider configured (NEWS_PROVIDER / MACRO_PROVIDER)"}
-        results = {}
+            return {"skipped": "FINNHUB_API_KEY not configured"}
+        results: dict[str, Any] = {}
         for provider in providers:
-            results[provider.name] = await IntelligenceService(session, bus).ingest(provider)
+            try:
+                results[provider.name] = await IntelligenceService(session, bus).ingest(provider)
+            except (ConnectionError, ValueError) as exc:
+                session.rollback()
+                results[provider.name] = {"error": redact(str(exc), settings.secret_values())[:300]}
+        if all("error" in item for item in results.values()):
+            raise ConnectionError("all news sources failed: " + "; ".join(item["error"] for item in results.values()))
         return results
+
+    async def macro_ingestion(session: Session) -> dict[str, Any]:
+        report = await MacroService(session, settings).ingest()
+        if report and not report.get("skipped") and all("error" in item for item in report.values()):
+            raise ConnectionError("all FRED series failed: " + next(iter(report.values()))["error"])
+        return report
+
+    async def provider_verification(session: Session) -> dict[str, Any]:
+        # Real generation calls cost tokens: prove Gemini generation at most every 6 hours.
+        last = session.scalar(select(ProviderCheck.checked_at).where(
+            ProviderCheck.provider == "gemini", ProviderCheck.check == "structured_generation").order_by(desc(ProviderCheck.checked_at)))
+        generate = last is None or TimeService.now() - TimeService.ensure_utc(last) > timedelta(hours=6)
+        result = await ProviderVerifier(settings).run(session, generate=generate)
+        return {name: item["state"] for name, item in result["providers"].items()}
+
+    async def testnet_reconciliation(session: Session) -> dict[str, Any]:
+        from app.execution.binance_testnet import BinanceTestnetExchange
+
+        exchange = BinanceTestnetExchange(session, settings, bus)
+        report = await exchange.reconcile()
+        await exchange.sync_portfolio()
+        session.commit()
+        return report
 
     async def research_queue(session: Session) -> dict[str, Any]:
         if system_halted(session) or not settings.autonomous_research_enabled:
@@ -255,7 +289,11 @@ def jobs(context: JobContext) -> dict[str, tuple[int, Callable[[Session], Awaita
         "research_queue": (settings.research_interval_seconds, research_queue),
         "data_integrity": (3600, data_integrity),
         "news_ingestion": (settings.news_ingestion_interval_seconds, news_ingestion),
+        "macro_ingestion": (settings.macro_ingestion_interval_seconds, macro_ingestion),
+        "provider_verification": (settings.provider_check_interval_seconds, provider_verification),
     }
+    if settings.execution_mode == "testnet":
+        registered["testnet_reconciliation"] = (300, testnet_reconciliation)
     if settings.market_scanner_enabled:
         registered["universe_refresh"] = (settings.universe_refresh_seconds, universe_refresh)
         registered["market_scan"] = (settings.scanner_interval_seconds, market_scan)
@@ -268,3 +306,20 @@ def hypothesis_backlog(session: Session) -> int:
     return session.scalar(select(func.count()).select_from(Hypothesis).where(
         Hypothesis.stage.notin_([HypothesisStage.REJECTED, HypothesisStage.FAILED, HypothesisStage.ARCHIVED])
     )) or 0
+
+
+JOB_PURPOSE = {
+    "safety_monitor": "Automatic safe mode on loss/drawdown, stale data, provider failure, repeated rejections, corrupt state",
+    "opportunity_cleanup": "Expire scanner/decision opportunities past their time-to-live",
+    "learning": "Trade memory, post-trade analysis, counterfactuals, strategy health",
+    "research_queue": "Generate hypotheses from evidence and advance them through validation gates",
+    "data_integrity": "Detect missing or stale candles for scanned assets",
+    "news_ingestion": "Fetch Finnhub crypto news and (if the plan allows) the economic calendar",
+    "macro_ingestion": "Fetch FRED series with point-in-time vintages",
+    "provider_verification": "Real connectivity/capability checks for Binance, Gemini, Finnhub, FRED",
+    "universe_refresh": "Rebuild the eligible Binance universe from exchange metadata",
+    "market_scan": "Scan eligible assets for unusual conditions (never trades)",
+    "market_data_sync": "Backfill closed candles for eligible assets from Binance",
+    "testnet_reconciliation": "Refresh non-final testnet orders and testnet balances",
+}
+RETRY_POLICY = "No immediate retry: a failed run is recorded as FAILED and retried at the next scheduled run; provider calls retry transient errors internally."

@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -7,17 +8,30 @@ from sqlalchemy.orm import Session
 
 from app.core.config import Settings
 from app.core.decimal_math import ONE, ZERO, decimal, money, price, quantity, rate
+from app.core.time import TimeService
+from app.global_services.historical import TIMEFRAME_DELTA
 from app.models import (
     Asset,
+    AssetEligibility,
     AssetInstrument,
-    PortfolioSnapshot,
     Position,
     RiskEvent,
     StrategyVersion,
     TradeIntent,
 )
+from app.trading.accounts import latest_portfolio, venue_for
 from app.trading.portfolio_intelligence import PortfolioIntelligence
 from app.trading.safety import SafetyService
+
+
+@dataclass
+class MarketFacts:
+    """Market evidence supplied by the caller; Risk verifies it independently of the strategy/AI."""
+
+    exchange: str
+    timeframe: str
+    observed_at: datetime
+    last_candle_at: datetime | None
 
 
 @dataclass
@@ -35,14 +49,14 @@ class RiskAssessment:
 class RiskEngine:
     """Layer 3 owns final size, protection, leverage, margin and rejection."""
 
-    def __init__(self, session: Session, settings: Settings) -> None:
+    def __init__(self, session: Session, settings: Settings, venue: str | None = None) -> None:
         self.session = session
         self.settings = settings
+        self.venue = venue or venue_for(settings)
 
-    def assess(self, intent: TradeIntent, market_price: float, volatility: float) -> RiskAssessment:
-        portfolio = self.session.scalar(
-            select(PortfolioSnapshot).order_by(PortfolioSnapshot.captured_at.desc())
-        )
+    def assess(self, intent: TradeIntent, market_price: float, volatility: float,
+               facts: MarketFacts | None = None) -> RiskAssessment:
+        portfolio = latest_portfolio(self.session, self.venue)
         equity = decimal(portfolio.equity) if portfolio else decimal(self.settings.starting_equity)
         available = decimal(portfolio.available_balance) if portfolio else equity
         exposure = decimal(portfolio.exposure) if portfolio else ZERO
@@ -51,7 +65,8 @@ class RiskEngine:
         market = price(market_price)
         volatility_rate = decimal(volatility)
         open_positions = self.session.scalar(
-            select(func.count()).select_from(Position).where(Position.status.in_(["OPENING", "OPEN", "MANAGING", "CLOSING"]))
+            select(func.count()).select_from(Position).where(
+                Position.venue == self.venue, Position.status.in_(["OPENING", "OPEN", "MANAGING", "CLOSING"]))
         ) or 0
         reasons: list[str] = []
         if equity <= ZERO or available <= ZERO:
@@ -63,7 +78,7 @@ class RiskEngine:
         if open_positions >= self.settings.max_open_positions:
             reasons.append("MAX_POSITIONS")
         conflicting = self.session.scalar(select(func.count()).select_from(Position).where(
-            Position.symbol == intent.symbol,
+            Position.venue == self.venue, Position.symbol == intent.symbol,
             Position.strategy_version_id == intent.strategy_version_id,
             Position.status.in_(["OPENING", "OPEN", "MANAGING", "PARTIALLY_CLOSING", "CLOSING"]),
         )) or 0
@@ -77,6 +92,10 @@ class RiskEngine:
             select(StrategyVersion.strategy_id).where(StrategyVersion.id == intent.strategy_version_id)
         )
         reasons.extend(SafetyService(self.session).blocks_new_orders(strategy_id, intent.symbol))
+        if self.venue == "none":
+            reasons.append("EXECUTION_DISABLED")
+        if facts is not None:
+            reasons.extend(self._market_checks(intent.symbol, facts))
         if reasons:
             return self._record(intent, RiskAssessment(False, reasons))
 
@@ -93,11 +112,14 @@ class RiskEngine:
                                if declared.get("take_profit_pct") else stop_fraction * 2)
         stop_loss = price(market * (ONE - stop_fraction if intent.side == "BUY" else ONE + stop_fraction))
         take_profit = price(market * (ONE + target_fraction if intent.side == "BUY" else ONE - target_fraction))
+        if target_fraction / stop_fraction < decimal(self.settings.min_reward_risk):
+            reasons.append("REWARD_RISK_BELOW_MINIMUM")
+            return self._record(intent, RiskAssessment(False, reasons))
         risk_amount = money(equity * decimal(self.settings.max_risk_per_trade))
         raw_quantity = risk_amount / abs(market - stop_loss)
         remaining_exposure = max(ZERO, decimal(self.settings.max_total_exposure) - exposure)
         raw_quantity = min(raw_quantity, equity * remaining_exposure / market)
-        portfolio_view: dict[str, Any] = PortfolioIntelligence(self.session).assess_candidate(
+        portfolio_view: dict[str, Any] = PortfolioIntelligence(self.session, venue=self.venue).assess_candidate(
             intent.symbol, 0.0, float(equity), threshold=self.settings.correlation_threshold,
             max_cluster=self.settings.max_correlated_exposure, max_symbol=self.settings.max_symbol_concentration,
         ) if equity > ZERO else {"symbol_exposure": 1.0, "cluster_exposure": 1.0, "cluster": [intent.symbol]}
@@ -138,12 +160,38 @@ class RiskEngine:
         )
         return self._record(intent, assessment, portfolio_view)
 
+    def _market_checks(self, symbol: str, market: MarketFacts) -> list[str]:
+        """Data freshness, liquidity and spread gates. Missing evidence on a real exchange rejects."""
+        reasons: list[str] = []
+        interval = TIMEFRAME_DELTA.get(market.timeframe, timedelta(hours=1))
+        if market.last_candle_at is None:
+            reasons.append("NO_MARKET_DATA")
+        else:
+            age = TimeService.ensure_utc(market.observed_at) - TimeService.ensure_utc(market.last_candle_at)
+            if age > interval * (self.settings.market_data_max_age_bars + 1):
+                reasons.append("STALE_MARKET_DATA")
+        if market.exchange in {"paper"}:
+            return reasons  # synthetic demo data has no liquidity statistics (demo mode only)
+        eligibility = self.session.scalar(select(AssetEligibility).where(
+            AssetEligibility.exchange == market.exchange, AssetEligibility.symbol == symbol,
+        ).order_by(AssetEligibility.evaluated_at.desc()))
+        if eligibility is None:
+            reasons.append("NO_LIQUIDITY_EVIDENCE")
+            return reasons
+        metrics = eligibility.metrics or {}
+        if not eligibility.eligible:
+            reasons.append("ASSET_NOT_ELIGIBLE")
+        spread = metrics.get("spread_bps")
+        if spread is None or float(spread) > self.settings.universe_max_spread_bps:
+            reasons.append("SPREAD_TOO_WIDE_OR_UNKNOWN")
+        if float(metrics.get("quote_volume_24h") or 0) < self.settings.universe_min_quote_volume_24h:
+            reasons.append("INSUFFICIENT_LIQUIDITY")
+        return reasons
+
     def _record(
         self, intent: TradeIntent, assessment: RiskAssessment, portfolio_view: dict | None = None,
     ) -> RiskAssessment:
-        portfolio = self.session.scalar(
-            select(PortfolioSnapshot).order_by(PortfolioSnapshot.captured_at.desc())
-        )
+        portfolio = latest_portfolio(self.session, self.venue)
         self.session.add(RiskEvent(
             trade_intent_id=intent.id,
             outcome="APPROVED" if assessment.approved else "REJECTED",

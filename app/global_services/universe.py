@@ -333,3 +333,13 @@ class UniverseService:
     @staticmethod
     def is_eligible(session: Session, exchange: str, symbol: str) -> bool:
         return symbol in UniverseService.eligible_symbols(session, exchange)
+
+
+def liquidity_state(session: Session, exchange: str, symbol: str) -> str:
+    """STRONG only with current eligibility evidence; otherwise WEAK or UNKNOWN (never assumed)."""
+    row = session.scalar(select(AssetEligibility).where(
+        AssetEligibility.exchange == exchange, AssetEligibility.symbol == symbol,
+    ).order_by(desc(AssetEligibility.evaluated_at)))
+    if row is None:
+        return "UNKNOWN"
+    return "STRONG" if row.eligible else "WEAK"

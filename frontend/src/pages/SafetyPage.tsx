@@ -37,14 +37,10 @@ export default function SafetyPage(){
       </Card>
       <Card eyebrow="SYSTEM" title="Providers and services">
         <div className="status-list">
-          <p><span>Binance public data</span><b>{p.binance?.live_stream||'—'} · {p.binance?.connected?'connected':'not streaming'}</b></p>
-          <p><span>Binance private trading</span><b className="safe-text">{p.binance?.private_trading||'disabled'}</b></p>
-          <p><span>Last universe refresh</span><b>{when(p.binance?.last_universe_refresh)}</b></p>
-          <p><span>News provider</span><b>{p.news?.news?.configured?p.news.news.provider:'not configured'}</b></p>
-          <p><span>Macro provider</span><b>{p.news?.macro?.configured?p.news.macro.provider:'not configured'}</b></p>
-          <p><span>AI provider</span><b>{p.ai?.configured?`${p.ai.provider} · ${p.ai.model}`:'not configured'}</b></p>
-          <p><span>Database</span><b>{p.database?.status||'—'} · {p.database?.dialect||''}</b></p>
-          <p><span>Event bus</span><b>{p.event_bus?.published??0} published · {p.event_bus?.failures??0} failures</b></p>
+          <p><span>Overall</span><b>{p.overall||'—'}</b></p>
+          {Object.entries((p.components||{}) as Record<string,Obj>).map(([name,item])=><p key={name}><span>{name.replaceAll('_',' ')}</span><b>{item.state||'—'}{item.detail?` · ${item.detail}`:''}</b></p>)}
+          <p><span>Real-money trading</span><b className="safe-text">{p.real_trading||'DISABLED'}</b></p>
+          <p><span>Execution mode</span><b>{String(p.execution_mode||'—').toUpperCase()} · {p.data_mode||'—'} data</b></p>
         </div>
       </Card>
     </div>

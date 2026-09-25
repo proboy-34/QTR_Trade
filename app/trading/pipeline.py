@@ -12,6 +12,7 @@ from app.core.lineage import code_version, risk_configuration
 from app.core.time import TimeService
 from app.global_services.historical import TIMEFRAME_DELTA
 from app.global_services.market_data import MarketDataQuality
+from app.global_services.market_intelligence import knowable_at
 from app.global_services.regime import candles_frame
 from app.global_services.universe import UniverseService
 from app.memory.trade_memory import base_asset
@@ -30,8 +31,10 @@ from app.models import (
     TradeIntent,
 )
 from app.research.dsl import CompiledStrategy, StrategySpec, spec_from_version
+from app.trading.accounts import venue_for
 from app.trading.paper_exchange import PaperExchange
-from app.trading.risk import RiskEngine
+from app.trading.reasoning import DecisionReasoner
+from app.trading.risk import MarketFacts, RiskEngine
 from app.trading.safety import SafetyService
 
 
@@ -184,21 +187,40 @@ class TradingPipeline:
             if opportunity.status == "SELECTED":
                 selected = strategy, version, opportunity
 
+        rationale: dict[str, Any] = {}
+        if selected:
+            strategy_selected, version_selected, opportunity_selected = selected
+            source = next(item["signal_source"] for item in evaluations if item["opportunity_id"] == opportunity_selected.id)
+            rationale = DecisionReasoner(self.session, self.settings).assess(snapshot, strategy_selected, version_selected, source)
+            if rationale["decision"] == "TRADE_PROPOSAL":
+                rationale["ai_review"] = await self._ai_review(rationale)
+                review = rationale["ai_review"]
+                if self.settings.ai_trade_review == "veto" and review.get("verdict") == "REJECT":
+                    rationale["decision"], rationale["reason"] = "NO_TRADE", "AI review identified material contradicting evidence (veto mode)"
+            if rationale["decision"] == "NO_TRADE":
+                opportunity_selected.status = "REJECTED"
+                opportunity_selected.reasons = [*(opportunity_selected.reasons or []), f"reasoning: {rationale['reason']}"]
+                selected = None
         outcome = "TRADE" if selected else "WAIT"
         reasoning = [
-            "Eligible deterministic strategy and entry context found"
-            if selected
-            else "No active strategy currently satisfies every eligibility and entry condition"
+            rationale["reason"] if rationale else
+            "No active strategy currently satisfies every eligibility and entry condition"
         ]
+        if not rationale:
+            rationale = {"decision": "NO_TRADE", "reason": reasoning[0], "asset": snapshot.symbol,
+                         "decision_time": TimeService.ensure_utc(snapshot.observed_at).isoformat(),
+                         "strategies_evaluated": len(evaluations)}
+        rationale["decision"] = "TRADE" if selected else "NO_TRADE"
         decision = self._decision(
             snapshot,
             outcome,
             evaluations,
-            max((int(item["score"]) for item in evaluations), default=0) / 100,
+            float(rationale.get("evidence_strength", 0.0)),
             reasoning,
             correlation_id,
             selected[2].id if selected else None,
         )
+        decision.rationale = rationale
         await publish_persisted(self.session, self.event_bus, Event("DECISION_CREATED", {
             "decision_id": decision.id, "symbol": snapshot.symbol, "timeframe": snapshot.timeframe,
             "outcome": outcome, "strategies_evaluated": len(evaluations),
@@ -227,8 +249,15 @@ class TradingPipeline:
             Event("TradeIntentCreated", {"trade_intent_id": intent.id}, correlation_id),
             "decision",
         )
-        assessment = RiskEngine(self.session, self.settings).assess(
-            intent, snapshot.price, snapshot.volatility
+        venue = venue_for(self.settings)
+        if venue == "testnet":
+            from app.execution.binance_testnet import BinanceTestnetExchange
+
+            await BinanceTestnetExchange(self.session, self.settings, self.event_bus).sync_portfolio()
+        facts = MarketFacts(snapshot.exchange, snapshot.timeframe, snapshot.observed_at,
+                            self._last_candle_at(snapshot)) if self._has_candles(snapshot) else None
+        assessment = RiskEngine(self.session, self.settings, venue).assess(
+            intent, snapshot.price, snapshot.volatility, facts
         )
         if not assessment.approved:
             await publish_persisted(
@@ -242,6 +271,7 @@ class TradingPipeline:
                 ),
                 "portfolio_risk",
             )
+            decision.rationale = {**rationale, "risk": {"outcome": "REJECTED", "reasons": assessment.reason_codes}}
             self.session.commit()
             return {
                 "decision_id": decision.id,
@@ -252,7 +282,7 @@ class TradingPipeline:
             }
         plan = ExecutionPlan(
             trade_intent_id=intent.id,
-            exchange="paper",
+            exchange=venue,
             symbol=intent.symbol,
             side=intent.side,
             quantity=assessment.quantity,
@@ -265,15 +295,29 @@ class TradingPipeline:
         )
         self.session.add(plan)
         self.session.flush()
+        entry = float(snapshot.price)
+        stop, target = float(assessment.stop_loss), float(assessment.take_profit)
+        decision.rationale = {**rationale, "risk": {"outcome": "APPROVED"}, "plan": {
+            "venue": venue, "entry_reference": entry, "stop_loss": stop, "take_profit": [target],
+            "expected_reward_risk": round((target - entry) / (entry - stop), 3) if entry > stop else None,
+            "quantity": str(assessment.quantity), "notional": str(assessment.notional),
+            "risk_amount": str(assessment.risk_amount), "risk_pct_of_equity": self.settings.max_risk_per_trade,
+            "execution_plan_id": plan.id, "order_type": "MARKET"}}
         await publish_persisted(
             self.session,
             self.event_bus,
             Event("ExecutionPlanCreated", {"execution_plan_id": plan.id}, correlation_id),
             "portfolio_risk",
         )
-        execution = await PaperExchange(self.session, self.settings, self.event_bus).submit(
-            plan, intent, snapshot.price, correlation_id
-        )
+        if venue == "testnet":
+            from app.execution.binance_testnet import BinanceTestnetExchange
+
+            execution = await BinanceTestnetExchange(self.session, self.settings, self.event_bus).submit(
+                plan, intent, snapshot.price, correlation_id)
+        else:
+            execution = await PaperExchange(self.session, self.settings, self.event_bus).submit(
+                plan, intent, snapshot.price, correlation_id
+            )
         intent.status = "executed" if execution.get("position_id") else "submitted"
         self.session.commit()
         return {
@@ -284,6 +328,29 @@ class TradingPipeline:
             "execution_plan_id": plan.id,
             **execution,
         }
+
+    async def _ai_review(self, rationale: dict[str, Any]) -> dict[str, Any]:
+        if self.settings.ai_trade_review == "off":
+            return {"status": "DISABLED", "verdict": None}
+        from app.ai.providers import build_provider
+        from app.ai.research import AIResearchService
+
+        provider = build_provider(self.settings)
+        if not provider.configured:
+            return {"status": "NOT_CONFIGURED", "verdict": None,
+                    "fallback": "deterministic evidence rules only (AI review not performed)"}
+        review = await AIResearchService(self.session, self.settings, self.event_bus, provider).review_trade(rationale)
+        return {**review, "mode": self.settings.ai_trade_review}
+
+    def _has_candles(self, snapshot: MarketSnapshot) -> bool:
+        return snapshot.exchange != "paper" or self._last_candle_at(snapshot) is not None
+
+    def _last_candle_at(self, snapshot: MarketSnapshot):
+        return self.session.scalar(select(MarketCandle.timestamp).where(
+            MarketCandle.exchange == snapshot.exchange, MarketCandle.symbol == snapshot.symbol,
+            MarketCandle.timeframe == snapshot.timeframe,
+            MarketCandle.timestamp <= TimeService.ensure_utc(snapshot.observed_at),
+        ).order_by(desc(MarketCandle.timestamp)))
 
     def _remember_context(self, snapshot: MarketSnapshot) -> MarketContextRecord:
         previous = self.session.scalar(
@@ -353,8 +420,10 @@ class TradingPipeline:
             MarketCandle.timeframe == snapshot.timeframe, MarketCandle.timestamp <= observed,
         ).order_by(desc(MarketCandle.timestamp)))
         base = base_asset(snapshot.symbol)
+        # Only information knowable at decision time (no look-ahead).
+        known = knowable_at()
         events = self.session.scalars(select(MarketEvent).where(
-            MarketEvent.event_at >= observed - timedelta(hours=24), MarketEvent.event_at <= observed + timedelta(hours=1),
+            known >= observed - timedelta(hours=24), known <= observed,
         ).limit(500)).all()
         event_ids = [item.id for item in events
                      if base in (item.affected_assets or []) or "RISK_ASSETS" in (item.affected_assets or [])]

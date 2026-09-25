@@ -1,14 +1,13 @@
 """API for the autonomous research platform: universe, scanner, intelligence, AI, research,
 memory, learning, portfolio intelligence and safety. All figures come from persisted state."""
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
-from app.ai.providers import build_provider
 from app.ai.research import AIResearchService
 from app.api import event_bus, live_paper_service, page
 from app.core.auth import Principal, Role, require
@@ -26,7 +25,9 @@ from app.global_services.market_intelligence import (
 from app.global_services.regime import load_candles
 from app.global_services.scanner import MarketScanner
 from app.global_services.universe import UniverseService
-from app.jobs import JobContext, jobs, run_job, scan_symbols
+from app.integrations.fred import MacroService, macro_as_of
+from app.integrations.health import ProviderVerifier, system_health
+from app.jobs import JOB_PURPOSE, RETRY_POLICY, JobContext, jobs, run_job, scan_symbols
 from app.learning.paper_validation import trade_statistics
 from app.learning.post_trade import learning_summary
 from app.memory.knowledge import KnowledgeBase
@@ -37,15 +38,18 @@ from app.models import (
     AICallRecord,
     AssetEligibility,
     CounterfactualEvaluation,
+    Decision,
     DiscrepancyReport,
     Experiment,
     Hypothesis,
+    JobExecution,
     KnowledgeEntry,
     MarketDataValidationFailure,
     MarketEvent,
     MarketRegimeRecord,
     Opportunity,
     PostTradeAnalysis,
+    ProviderCheck,
     SafetyControl,
     Strategy,
     StrategyHealthRecord,
@@ -218,15 +222,15 @@ def intelligence_events(verification: str | None = None, event_type: str | None 
 
 
 @router.get("/intelligence/providers")
-def intelligence_providers() -> dict:
-    return provider_status(get_settings())
+def intelligence_providers(session: Session = Depends(get_db)) -> dict:
+    return provider_status(get_settings(), session)
 
 
 @router.post("/intelligence/ingest")
 async def ingest_intelligence(_: Principal = Depends(researcher), session: Session = Depends(get_db)) -> dict:
-    providers = configured_providers(get_settings())
+    providers = configured_providers(get_settings(), session)
     if not providers:
-        raise QTRError("No news or macro provider configured. Set NEWS_PROVIDER/NEWS_PROVIDER_API_KEY or MACRO_PROVIDER/MACRO_PROVIDER_API_KEY.")
+        raise QTRError("No news provider configured. Set FINNHUB_API_KEY.")
     return {provider.name: await IntelligenceService(session, event_bus).ingest(provider) for provider in providers}
 
 
@@ -511,24 +515,70 @@ def clear_safety(control_id: str, principal: Principal = Depends(admin), session
 
 @router.get("/system/providers")
 def system_providers(session: Session = Depends(get_db)) -> dict:
+    """Truthful component health derived from real verification records, data freshness and jobs."""
     from app.main import orchestrator
 
     settings = get_settings()
-    live = live_paper_service.snapshot()
-    ai = build_provider(settings)
-    universe_run = session.scalar(select(AssetEligibility).order_by(desc(AssetEligibility.evaluated_at)))
-    return {
-        "binance": {"market_data": "public (no credentials)", "live_stream": live["status"], "connected": live["connected"],
-                    "last_universe_refresh": universe_run.evaluated_at if universe_run else None,
-                    "private_trading": "disabled (no authenticated adapter installed)",
-                    "credentials_configured": bool(settings.binance_api_key and settings.binance_api_secret)},
-        "news": provider_status(settings),
-        "ai": {"provider": ai.name, "model": ai.model, "configured": ai.configured, "enabled": settings.ai_enabled},
-        "database": {"status": "healthy", "dialect": session.get_bind().dialect.name},
-        "scheduler": {name: {"status": state.status, "runs": state.runs, "last_run": state.last_run,
-                             "next_run": state.next_run, "last_error": state.last_error}
-                      for name, state in orchestrator.states.items()},
-        "event_bus": {"published": event_bus.published, "failures": event_bus.failures, "healthy": event_bus.healthy},
-        "safety": {"active_controls": len(SafetyService(session).active())},
-        "real_trading": "DISABLED",
-    }
+    states = {name: {"status": state.status, "runs": state.runs, "last_run": state.last_run,
+                     "next_run": state.next_run, "last_error": state.last_error}
+              for name, state in orchestrator.states.items()}
+    report = system_health(session, settings, states, live_paper_service.snapshot(), event_bus)
+    return {**report, "scheduler": states, "intelligence": provider_status(settings, session),
+            "safety": {"active_controls": len(SafetyService(session).active())},
+            "real_trading": "DISABLED", "live_execution_adapter_installed": False}
+
+
+@router.post("/system/providers/verify")
+async def verify_providers(generate: bool = True, _: Principal = Depends(researcher),
+                           session: Session = Depends(get_db)) -> dict:
+    """Run real checks against Binance, Gemini, Finnhub and FRED now (no orders, minimal AI request)."""
+    return await ProviderVerifier(get_settings()).run(session, generate=generate)
+
+
+@router.get("/system/provider-checks")
+def provider_checks(provider: str | None = None, session: Session = Depends(get_db)) -> dict:
+    criteria = (ProviderCheck.provider == provider,) if provider else ()
+    rows = session.scalars(select(ProviderCheck).where(*criteria).order_by(desc(ProviderCheck.checked_at)).limit(300)).all()
+    return {"items": [serialize(row) for row in rows]}
+
+
+@router.get("/system/jobs/registry")
+def job_registry(session: Session = Depends(get_db)) -> dict:
+    from app.main import orchestrator
+
+    items = []
+    for name, (interval, _) in jobs(job_context()).items():
+        last = session.scalar(select(JobExecution).where(JobExecution.job_name == name).order_by(desc(JobExecution.started_at)))
+        failures = session.scalar(select(func.count()).select_from(JobExecution).where(
+            JobExecution.job_name == name, JobExecution.status == "FAILED",
+            JobExecution.started_at >= TimeService.now() - timedelta(days=1))) or 0
+        state = orchestrator.states.get(name)
+        items.append({"job": name, "purpose": JOB_PURPOSE.get(name, ""), "interval_seconds": interval,
+                      "retry_policy": RETRY_POLICY, "idempotent": True,
+                      "scheduler_state": state.status if state else "NOT_SCHEDULED",
+                      "next_run": state.next_run if state else None,
+                      "last_status": last.status if last else None, "last_started_at": last.started_at if last else None,
+                      "last_duration_ms": last.duration_ms if last else None, "last_error": last.error if last else None,
+                      "last_details": last.details if last else None, "failures_24h": failures})
+    return {"items": items}
+
+
+@router.post("/macro/ingest")
+async def ingest_macro(_: Principal = Depends(researcher), session: Session = Depends(get_db)) -> dict:
+    return await MacroService(session, get_settings()).ingest()
+
+
+@router.get("/macro/as-of")
+def macro_snapshot(at: datetime | None = None, session: Session = Depends(get_db)) -> dict:
+    """Macro values that were public at `at` (default now), with provenance and release availability."""
+    moment = TimeService.ensure_utc(at) if at else TimeService.now()
+    return {"as_of": moment.isoformat(), "series": macro_as_of(session, moment)}
+
+
+@router.get("/decisions/{decision_id}/rationale")
+def decision_rationale(decision_id: str, session: Session = Depends(get_db)) -> dict:
+    decision = session.get(Decision, decision_id)
+    if not decision:
+        raise NotFoundError("Decision not found")
+    return {"decision_id": decision.id, "outcome": decision.outcome, "created_at": decision.created_at,
+            "rationale": decision.rationale or {}, "lineage": decision.lineage or {}}

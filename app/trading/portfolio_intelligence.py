@@ -8,14 +8,16 @@ from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
 from app.core.decimal_math import decimal
-from app.models import MarketCandle, PortfolioSnapshot, Position
+from app.models import MarketCandle, Position
+from app.trading.accounts import latest_portfolio
 
 OPEN = ("OPENING", "OPEN", "MANAGING", "PARTIALLY_CLOSING", "CLOSING")
 
 
 class PortfolioIntelligence:
-    def __init__(self, session: Session, timeframe: str = "1h", lookback: int = 200) -> None:
+    def __init__(self, session: Session, timeframe: str = "1h", lookback: int = 200, venue: str = "paper") -> None:
         self.session = session
+        self.venue = venue
         self.timeframe = timeframe
         self.lookback = lookback
 
@@ -36,10 +38,10 @@ class PortfolioIntelligence:
         return series.pct_change().dropna()
 
     def exposures(self) -> tuple[dict[str, float], float]:
-        latest = self.session.scalar(select(PortfolioSnapshot).order_by(PortfolioSnapshot.captured_at.desc()))
+        latest = latest_portfolio(self.session, self.venue)
         equity = float(latest.equity) if latest else 0.0
         notional: dict[str, float] = {}
-        for position in self.session.scalars(select(Position).where(Position.status.in_(OPEN))).all():
+        for position in self.session.scalars(select(Position).where(Position.venue == self.venue, Position.status.in_(OPEN))).all():
             sign = 1 if position.side == "BUY" else -1
             notional[position.symbol] = notional.get(position.symbol, 0.0) + sign * float(
                 decimal(position.quantity) * decimal(position.current_price))

@@ -199,7 +199,7 @@ def test_market_memory_similarity_returns_evidence_not_prediction(session):
 @pytest.mark.asyncio
 async def test_decision_memory_reconstructs_inputs_by_reference(session):
     strategy, version = strategy_with_version(session)
-    event = MarketEvent(category="NEWS", event_type="ETF", title="BTC ETF approval", severity="HIGH", event_at=NOW - timedelta(hours=1),
+    event = MarketEvent(category="NEWS", event_type="ETF", title="BTC ETF approval", severity="MEDIUM", event_at=NOW - timedelta(hours=1),
                         source="fixture", affected_assets=["BTC"], description="d", verification_status="SOURCE_VERIFIED")
     session.add(event)
     session.commit()

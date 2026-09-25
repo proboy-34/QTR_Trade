@@ -64,7 +64,7 @@ Verified by running the repository, not by reading the previous report:
 | 11 | Market scanner (volume, volatility, breakout, momentum, trend, abnormal move, liquidity, market-wide, correlation) | MISSING | IMPLEMENTED | `app/global_services/scanner.py` | Tune thresholds from recorded counterfactual evidence |
 | 35 | Opportunity ranking (liquidity, data quality, regime clarity, signal strength, strategy applicability, news, risk) | Score inside pipeline only | IMPLEMENTED | `OpportunityRanker` | Weights are reviewed constants; revisit once enough outcomes exist |
 | 12, 33 | Regime engine with confidence, evidence, UNKNOWN on ambiguity, persisted transitions | Two labels (trending/sideways) | IMPLEMENTED | `app/global_services/regime.py` | Cross-asset (market-wide) regime is not yet a separate label |
-| 13–15 | Provider-neutral news/macro intelligence, structured events, dedup, source identity, macro surprise | Manual events only | IMPLEMENTED / NEEDS CREDENTIALS | `app/global_services/market_intelligence.py` | CryptoPanic and Finnhub adapters are untested against live APIs (no keys). Exchange-announcement feeds not yet added |
+| 13–15 | Provider-neutral news/macro intelligence, structured events, dedup, source identity, macro surprise | Manual events only | IMPLEMENTED / NOT VERIFIED LIVE | `app/global_services/market_intelligence.py`, `app/integrations/fred.py` | Finnhub news/calendar and FRED point-in-time series. Keys configured locally but the build sandbox's network policy blocks finnhub.io and api.stlouisfed.org (see docs/AUDIT_2026-09-25.md). CryptoPanic removed. |
 | 15, 40 | Hallucination firewall (FACT / INTERPRETATION / HYPOTHESIS / METRIC; UNVERIFIED) | MISSING | IMPLEMENTED | `app/ai/firewall.py` | — |
 | 16, 18 | AI provider abstraction + Gemini adapter + research tasks | MISSING | IMPLEMENTED / NEEDS CREDENTIALS | `app/ai/providers.py`, `app/ai/research.py` | Gemini tested with a mocked HTTP transport only |
 | 41 | AI cost control: budgets, hourly limit, token/cost/latency/failure records, caching | MISSING | IMPLEMENTED | `app/ai/gateway.py` | Cost rates are configurable approximations |
@@ -124,10 +124,10 @@ Decision (declarative entry/exit on closed candles) ──► Risk (portfolio, k
 1. Run the full loop against real Binance public data on the operator's machine for
    several days (the build sandbox blocks Binance). Watch `/api/v1/system/jobs`,
    `/api/v1/safety` and the data-integrity job; tune scan/sync intervals to observed load.
-2. Configure a news provider (`NEWS_PROVIDER=cryptopanic` or `finnhub`) and verify the
-   adapters against live payloads; add exchange-announcement ingestion.
-3. Configure `GEMINI_API_KEY`, observe AI costs against `AI_DAILY_BUDGET`, and review the
-   first AI hypotheses and their firewall verdicts.
+2. Allow finnhub.io and api.stlouisfed.org, run **Verify providers now**, and confirm
+   Finnhub plan coverage (news vs economic calendar) and FRED vintage ingestion on real payloads.
+3. Observe Gemini costs against `AI_DAILY_BUDGET` (generation verified live on 2026-09-25) and
+   review the first AI hypotheses, trade reviews and their firewall verdicts.
 4. Recalibrate validation gates on real multi-asset history (false-positive rate on
    shuffled/benchmark strategies) and record the calibration as research evidence.
 5. PostgreSQL for continuous operation (SQLite remains the local default).
@@ -147,9 +147,10 @@ Decision (declarative entry/exit on closed candles) ──► Risk (portfolio, k
 
 | Provider | Setting | Required for | Status in this work |
 | --- | --- | --- | --- |
-| Binance public data | none | Universe, candles, live stream | Code complete; not reachable from build sandbox (HTTP 403 via proxy) |
-| Binance private trading | `BINANCE_API_KEY/SECRET` | Nothing (no private adapter) | Not used; paper never uses private credentials |
-| Gemini | `GEMINI_API_KEY` | AI research tasks | NOT TESTED — CREDENTIAL MISSING (adapter tested with mocked HTTP) |
-| CryptoPanic / Finnhub news | `NEWS_PROVIDER`, `NEWS_PROVIDER_API_KEY` | News ingestion | NOT TESTED — CREDENTIAL MISSING (parsers tested with fixtures) |
-| Finnhub economic calendar | `MACRO_PROVIDER`, `MACRO_PROVIDER_API_KEY` | Macro ingestion | NOT TESTED — CREDENTIAL MISSING |
+| Binance public data | none | Universe, candles, live stream | NOT VERIFIED — build sandbox network policy returns 403 for Binance hosts |
+| Binance mainnet key | `BINANCE_API_KEY/SECRET` | Read-only permission check only | Key present, secret absent → SKIPPED (unverified) |
+| Binance Spot Testnet | `BINANCE_TESTNET_API_KEY/SECRET`, `EXECUTION_MODE=testnet` | Testnet execution | Adapter tested with mocked HTTP; no testnet keys provided |
+| Gemini | `GEMINI_API_KEY`, `GEMINI_MODEL` | AI research, trade review | VERIFIED 2026-09-25 (gemini-3.8-flash; real structured generation) |
+| Finnhub | `FINNHUB_API_KEY` | News + economic calendar | NOT VERIFIED — host blocked by sandbox network policy |
+| FRED | `FRED_API_KEY` | Point-in-time macro series | NOT VERIFIED — host blocked by sandbox network policy |
 | Telegram | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | Notifications | Unchanged |

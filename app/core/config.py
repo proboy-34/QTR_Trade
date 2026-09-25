@@ -15,7 +15,10 @@ class Settings(BaseSettings):
     live_trading_confirmation: str = ""
     database_url: str = "sqlite:///./qtr.db"
     log_level: str = "INFO"
-    demo_mode: bool = True
+    # Synthetic demo data (seeded candles/strategy/event) is only created when explicitly enabled.
+    demo_mode: bool = False
+    # Execution venue. LIVE is not offered: no live adapter exists and none may be enabled here.
+    execution_mode: Literal["paper", "testnet", "live_disabled"] = "paper"
     default_symbol: str = "BTCUSDT"
     starting_equity: float = 100_000.0
     max_risk_per_trade: float = Field(0.01, gt=0, le=0.05)
@@ -70,18 +73,26 @@ class Settings(BaseSettings):
     opportunity_ttl_minutes: int = Field(240, ge=5)
 
     # Market intelligence (news / macro). Empty provider = manual events only.
-    news_provider: Literal["", "cryptopanic", "finnhub"] = ""
-    news_provider_api_key: str = ""
-    news_provider_base_url: str = ""
-    macro_provider: Literal["", "finnhub"] = ""
-    macro_provider_api_key: str = ""
+    # Finnhub: crypto news and (plan permitting) the economic calendar.
+    finnhub_api_key: str = ""
+    finnhub_news_enabled: bool = True
+    finnhub_calendar_enabled: bool = True
+    # FRED: point-in-time macro series (ALFRED vintages prevent look-ahead).
+    fred_api_key: str = ""
+    fred_series: str = "DFF,DGS2,DGS10,T10Y2Y,CPIAUCSL,UNRATE,PAYEMS,M2SL"
+    fred_history_years: int = Field(10, ge=1, le=60)
+    macro_ingestion_interval_seconds: int = Field(21_600, ge=600)
+    provider_check_interval_seconds: int = Field(900, ge=60)
     news_ingestion_interval_seconds: int = Field(900, ge=60)
 
     # AI research assistant (never an order authority)
     ai_provider: Literal["", "gemini"] = "gemini"
     ai_enabled: bool = True
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-2.5-flash"
+    # Verified 2026-09-25: gemini-2.5-flash is listed but no longer serves new keys.
+    gemini_model: str = "gemini-3.8-flash"
+    # AI review of TRADE proposals: off, advisory (recorded only) or veto (may turn TRADE into NO_TRADE).
+    ai_trade_review: Literal["off", "advisory", "veto"] = "advisory"
     gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
     ai_timeout_seconds: float = Field(30, gt=0, le=300)
     ai_max_retries: int = Field(2, ge=0, le=5)
@@ -110,6 +121,12 @@ class Settings(BaseSettings):
 
     binance_api_key: str = ""
     binance_api_secret: str = ""
+    # Spot testnet credentials are separate keys issued by testnet.binance.vision.
+    binance_testnet_api_key: str = ""
+    binance_testnet_api_secret: str = ""
+    # Risk: minimum reward/risk and maximum market-data age (in bars) for any new trade.
+    min_reward_risk: float = Field(1.5, ge=0.5, le=20)
+    market_data_max_age_bars: int = Field(3, ge=1, le=100)
     okx_api_key: str = ""
     okx_api_secret: str = ""
     okx_passphrase: str = ""
@@ -131,10 +148,17 @@ class Settings(BaseSettings):
             raise ValueError("Wildcard CORS is forbidden in live environment")
         if self.auth_mode == "token" and not self.auth_tokens.strip():
             raise ValueError("AUTH_MODE=token requires AUTH_TOKENS")
+        if self.execution_mode == "testnet" and not (self.binance_testnet_api_key and self.binance_testnet_api_secret):
+            raise ValueError("EXECUTION_MODE=testnet requires BINANCE_TESTNET_API_KEY and BINANCE_TESTNET_API_SECRET")
         if self.live_paper_autostart and self.trading_mode != "paper":
             raise ValueError("Live-data paper mode requires TRADING_MODE=paper")
         return self
 
+
+    def secret_values(self) -> list[str]:
+        """Every configured credential value, for log/error redaction."""
+        names = [name for name in type(self).model_fields if name.endswith(("_key", "_secret", "_token", "_passphrase", "_tokens"))]
+        return [value for name in names if len(value := str(getattr(self, name) or "")) >= 6]
 
     def csv(self, name: str) -> list[str]:
         value = getattr(self, name)

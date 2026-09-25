@@ -16,6 +16,7 @@ from app.core.decimal_math import decimal
 from app.core.events import Event, EventBus, publish_persisted
 from app.core.time import TimeService
 from app.models import Order, PortfolioSnapshot, Position, SafetyControl
+from app.trading.accounts import VENUES, latest_portfolio
 
 SCOPES = ("SYSTEM", "PAPER_TRADING", "NEW_ORDERS", "STRATEGY", "ASSET")
 GLOBAL_BLOCKING = ("SYSTEM", "PAPER_TRADING", "NEW_ORDERS")
@@ -89,20 +90,24 @@ class SafetyMonitor:
         }, source="safety_monitor"), "safety")
         return {"control_id": control.id, "scope": scope, "trigger": trigger}
 
+    async def _portfolio_checks(self, latest: PortfolioSnapshot | None, venue: str, triggered: list) -> None:
+        if latest is None:
+            return
+        equity = decimal(latest.equity)
+        if equity > 0 and decimal(latest.daily_pnl) / equity <= -decimal(self.settings.max_daily_loss):
+            triggered.append(await self._trigger("NEW_ORDERS", "EXCESSIVE_DAILY_LOSS", f"Daily loss limit breached ({venue})",
+                                                 venue=venue, daily_pnl=str(latest.daily_pnl)))
+        if decimal(latest.drawdown) >= decimal(self.settings.max_drawdown):
+            triggered.append(await self._trigger("NEW_ORDERS", "EXCESSIVE_DRAWDOWN", f"Maximum drawdown breached ({venue})",
+                                                 venue=venue, drawdown=str(latest.drawdown)))
+        if equity <= 0:
+            triggered.append(await self._trigger("PAPER_TRADING", "CORRUPTED_STATE", f"Non-positive {venue} equity", venue=venue))
+
     async def check(self, live_state: dict[str, Any] | None = None) -> dict[str, Any]:
         triggered: list[dict[str, Any] | None] = []
         now = TimeService.now()
-        latest = self.session.scalar(select(PortfolioSnapshot).order_by(PortfolioSnapshot.captured_at.desc()))
-        if latest:
-            equity = decimal(latest.equity)
-            if equity > 0 and decimal(latest.daily_pnl) / equity <= -decimal(self.settings.max_daily_loss):
-                triggered.append(await self._trigger("NEW_ORDERS", "EXCESSIVE_DAILY_LOSS", "Daily loss limit breached",
-                                                     daily_pnl=str(latest.daily_pnl)))
-            if decimal(latest.drawdown) >= decimal(self.settings.max_drawdown):
-                triggered.append(await self._trigger("NEW_ORDERS", "EXCESSIVE_DRAWDOWN", "Maximum drawdown breached",
-                                                     drawdown=str(latest.drawdown)))
-            if equity <= 0:
-                triggered.append(await self._trigger("PAPER_TRADING", "CORRUPTED_STATE", "Non-positive paper equity"))
+        for venue in VENUES:
+            await self._portfolio_checks(latest_portfolio(self.session, venue), venue, triggered)
         corrupted = self.session.scalar(select(func.count()).select_from(Position).where(
             Position.status.in_(["OPEN", "MANAGING"]),
             (Position.quantity <= 0) | (Position.entry_price <= 0),

@@ -24,6 +24,10 @@ from app.models import (
 
 
 def seed_demo(session: Session, settings: Settings) -> None:
+    """Synthetic candles, a demo strategy with seeded (not researched) evidence and a fabricated
+    event. Only ever called with DEMO_MODE=true; every row is flagged as demo."""
+    if not settings.demo_mode:
+        raise RuntimeError("seed_demo requires DEMO_MODE=true")
     asset = session.scalar(select(Asset).where(Asset.symbol == "BTCUSDT"))
     if not asset:
         asset = Asset(
@@ -91,7 +95,7 @@ def seed_demo(session: Session, settings: Settings) -> None:
     session.add_all([
         Dataset(name="BTCUSDT demo hourly", symbol="BTCUSDT", timeframe="1h", source="synthetic", row_count=240, is_demo=True),
         PortfolioSnapshot(equity=settings.starting_equity, available_balance=settings.starting_equity, exposure=0, margin_used=0, daily_pnl=0, drawdown=0),
-        MarketEvent(category="MACRO", severity="HIGH", event_at=now + timedelta(days=2), source="demo", affected_assets=["BTC","ETH"], description="Demo FOMC rate decision event", status="scheduled"),
+        MarketEvent(category="MACRO", severity="HIGH", event_at=now + timedelta(days=2), source="demo", affected_assets=["BTC","ETH"], description="DEMO DATA — fabricated FOMC event for demo mode only", title="DEMO: FOMC rate decision", status="scheduled", provider="demo", verification_status="DEMO", processing_status="DEMO", available_at=now),
         SystemEvent(type="ApplicationStarted", component="lifecycle", severity="INFO", message="QTR demo initialized", payload={"demo": True}, correlation_id="demo-startup"),
     ])
     configured = {

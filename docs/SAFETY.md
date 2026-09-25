@@ -1,13 +1,15 @@
 # Trading safety
 
-- Paper trading is the default and the only executable adapter. `TRADING_MODE=paper` and `LIVE_TRADING_ENABLED=false` are the checked-in defaults.
-- A configuration declaring `TRADING_MODE=live` is rejected unless both `LIVE_TRADING_ENABLED=true` and `LIVE_TRADING_CONFIRMATION=ENABLE_REAL_ORDERS` are present. Those gates express intent only: no private live order route, signed request, withdrawal or transfer code exists. An automated test scans the application source for authenticated order/withdrawal endpoints and fails if any appears.
-- Binance public market data needs no credentials. Private Binance keys are never used for paper execution.
+- `EXECUTION_MODE` is one of `paper` (default), `testnet` or `live_disabled`. `live` is rejected at startup; no real-money order adapter exists. In `live_disabled` there is no venue and Risk rejects every intent with `EXECUTION_DISABLED`.
+- `testnet` routes approved plans to the Binance **Spot Testnet** (`app/execution/binance_testnet.py`). Its host is a code constant (`https://testnet.binance.vision`), it requires its own `BINANCE_TESTNET_API_KEY/SECRET` (never the mainnet key), and every order, fill, position and portfolio snapshot is stored with `venue="testnet"`, so paper, testnet and (future) live state never mix.
+- A configuration declaring `TRADING_MODE=live` is rejected unless both `LIVE_TRADING_ENABLED=true` and `LIVE_TRADING_CONFIRMATION=ENABLE_REAL_ORDERS` are present; those gates express intent only. An automated allowlist test fails if signed requests appear outside the testnet adapter and the read-only mainnet account check, if `/api/v3/order` appears outside the testnet adapter, or if any futures, withdrawal or transfer endpoint appears.
+- The mainnet Binance key is used only for read-only verification (`GET /api/v3/account`, `GET /sapi/v1/account/apiRestrictions`). A key with withdrawals or internal transfers enabled is reported as `UNSAFE`. Having a key never enables execution.
+- Before a trade proposal reaches Risk, the evidence reasoner (`app/trading/reasoning.py`) records supporting, contradicting and blocking evidence that was knowable at decision time. Blocking evidence, or more contradicting than supporting evidence, produces NO TRADE. AI trade review (`AI_TRADE_REVIEW=off|advisory|veto`) can only turn a TRADE into NO TRADE.
 - Research can create candidates only. `approved` and `active` transitions require an operator (`actor="operator"`) and PASS validation evidence; research attempts raise a safety error.
 - AI is a researcher: it cannot create market facts, decisions, intents or orders. AI strategies are declarative data validated by QTR; no generated code is executed.
 - Active and paper-testing strategy versions cannot be edited. New work becomes a new version after suspension.
 - Trade Intent contains no final stop, target, size, or leverage. Risk owns all final plan values.
-- Risk rejects zero capital, insufficient margin, excessive daily loss/drawdown/exposure, maximum positions, invalid market inputs, exchange minimum violations, exhausted symbol/correlated-cluster budgets, and any active kill switch — before an Execution Plan exists.
+- Risk rejects zero capital, insufficient margin, excessive daily loss/drawdown/exposure, maximum positions, invalid market inputs, exchange minimum violations, exhausted symbol/correlated-cluster budgets, and any active kill switch — before an Execution Plan exists. With market facts it also rejects stale or missing candles (`STALE_MARKET_DATA`, `NO_MARKET_DATA`), missing/failed liquidity and spread evidence, and reward:risk below `MIN_REWARD_RISK`.
 
 ## Kill switch and safe mode
 

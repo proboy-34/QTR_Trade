@@ -1,4 +1,4 @@
-"""Provider-neutral market intelligence: news, macro calendars, exchange/regulatory events.
+"""Provider-neutral market intelligence: news and macro calendar events (Finnhub) plus operator entries.
 
 Every stored event keeps its provider, external identity, source and timestamps.
 Items without a traceable source are stored as UNVERIFIED. AI output never enters here.
@@ -16,11 +16,19 @@ from sqlalchemy.orm import Session
 
 from app.core.config import Settings
 from app.core.events import Event, EventBus, publish_persisted
+from app.core.logging import redact
 from app.core.time import TimeService
 from app.models import Asset, MarketEvent
 
 HIGH_IMPACT_CATEGORIES = {"FOMC", "CPI", "PPI", "GDP", "NFP", "REGULATION", "EXCHANGE_INCIDENT"}
 HIGH_IMPACT_TYPES = {"HACK", "EXCHANGE_INCIDENT", "DELISTING", "REGULATION", "MACRO_CPI", "MACRO_FOMC", "MACRO_NFP"}
+
+
+def knowable_at():
+    """SQL expression for when an event became knowable (availability, else publication/event time)."""
+    from sqlalchemy import func
+
+    return func.coalesce(MarketEvent.available_at, MarketEvent.published_at, MarketEvent.event_at)
 
 
 def is_high_impact(category: str, severity: str, event_type: str = "") -> bool:
@@ -68,42 +76,8 @@ def _timestamp(value: Any) -> datetime:
     return TimeService.ensure_utc(datetime.fromisoformat(str(value).replace("Z", "+00:00")))
 
 
-class CryptoPanicProvider:
-    """CryptoPanic developer API. Requires NEWS_PROVIDER_API_KEY (auth_token)."""
-
-    name, kind = "cryptopanic", "news"
-
-    def __init__(self, api_key: str, base_url: str = "") -> None:
-        self.api_key = api_key
-        self.base_url = base_url or "https://cryptopanic.com/api/developer/v2"
-
-    @staticmethod
-    def parse(payload: dict[str, Any]) -> list[RawIntelligenceItem]:
-        items: list[RawIntelligenceItem] = []
-        for post in payload.get("results", []):
-            if not post.get("id") or not post.get("title") or not post.get("published_at"):
-                continue
-            instruments = post.get("instruments") or post.get("currencies") or []
-            source = post.get("source") or {}
-            items.append(RawIntelligenceItem(
-                provider="cryptopanic", kind="news", external_id=str(post["id"]), title=post["title"],
-                published_at=_timestamp(post["published_at"]), summary=post.get("description") or "",
-                url=post.get("original_url") or post.get("url"),
-                source_name=source.get("title") or source.get("domain") or "cryptopanic",
-                currencies=[str(item.get("code", "")).upper() for item in instruments if item.get("code")],
-                raw={"kind": post.get("kind"), "domain": source.get("domain"), "votes": post.get("votes")},
-            ))
-        return items
-
-    async def fetch(self, since: datetime) -> list[RawIntelligenceItem]:
-        async with httpx.AsyncClient(base_url=self.base_url, timeout=20) as client:
-            response = await client.get("/posts/", params={"auth_token": self.api_key, "public": "true"})
-            response.raise_for_status()
-            return [item for item in self.parse(response.json()) if item.published_at >= since]
-
-
 class FinnhubNewsProvider:
-    """Finnhub market news (category=crypto). Requires NEWS_PROVIDER_API_KEY."""
+    """Finnhub market news (category=crypto). Requires FINNHUB_API_KEY."""
 
     name, kind = "finnhub", "news"
 
@@ -127,14 +101,17 @@ class FinnhubNewsProvider:
         return items
 
     async def fetch(self, since: datetime) -> list[RawIntelligenceItem]:
-        async with httpx.AsyncClient(base_url=self.base_url, timeout=20) as client:
-            response = await client.get("/news", params={"category": "crypto", "token": self.api_key})
-            response.raise_for_status()
-            return [item for item in self.parse(response.json()) if item.published_at >= since]
+        try:
+            async with httpx.AsyncClient(base_url=self.base_url, timeout=20) as client:
+                response = await client.get("/news", params={"category": "crypto", "token": self.api_key})
+                response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise ConnectionError(redact(f"Finnhub news failed: {exc}", [self.api_key])) from None
+        return [item for item in self.parse(response.json()) if item.published_at >= since]
 
 
 class FinnhubMacroProvider:
-    """Finnhub economic calendar. Requires MACRO_PROVIDER_API_KEY."""
+    """Finnhub economic calendar. Requires FINNHUB_API_KEY (and the endpoint on your plan)."""
 
     name, kind = "finnhub_macro", "macro"
 
@@ -162,12 +139,15 @@ class FinnhubMacroProvider:
 
     async def fetch(self, since: datetime) -> list[RawIntelligenceItem]:
         today = TimeService.now().date()
-        async with httpx.AsyncClient(base_url=self.base_url, timeout=20) as client:
-            response = await client.get("/calendar/economic", params={
-                "from": since.date().isoformat(), "to": (today + timedelta(days=7)).isoformat(), "token": self.api_key,
-            })
-            response.raise_for_status()
-            return self.parse(response.json())
+        try:
+            async with httpx.AsyncClient(base_url=self.base_url, timeout=20) as client:
+                response = await client.get("/calendar/economic", params={
+                    "from": since.date().isoformat(), "to": (today + timedelta(days=7)).isoformat(), "token": self.api_key,
+                })
+                response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise ConnectionError(redact(f"Finnhub economic calendar failed: {exc}", [self.api_key])) from None
+        return self.parse(response.json())
 
 
 TYPE_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -246,6 +226,8 @@ class EventNormalizer:
             "actual_value": item.actual, "previous_value": item.previous, "surprise": surprise,
             "unit": item.unit, "country": item.country,
             "raw_reference": {"provider": item.provider, "external_id": item.external_id, "url": item.url, **item.raw},
+            # News is knowable when published; a macro release is knowable at its release time.
+            "available_at": item.published_at, "retrieved_at": now,
             "processing_status": "NORMALIZED",
         }
 
@@ -254,29 +236,36 @@ def dedup_hash(provider: str, external_id: str) -> str:
     return hashlib.sha256(f"{provider}:{external_id}".encode()).hexdigest()
 
 
-def configured_providers(settings: Settings) -> list[MarketIntelligenceProvider]:
+def configured_providers(settings: Settings, session: Session | None = None) -> list[MarketIntelligenceProvider]:
+    """Finnhub sources the key can actually use. A capability that verification proved
+    unavailable (e.g. the economic calendar on a free plan) is not polled."""
+    from app.integrations.health import capability_available
+
     providers: list[MarketIntelligenceProvider] = []
-    if settings.news_provider == "cryptopanic" and settings.news_provider_api_key:
-        providers.append(CryptoPanicProvider(settings.news_provider_api_key, settings.news_provider_base_url))
-    if settings.news_provider == "finnhub" and settings.news_provider_api_key:
-        providers.append(FinnhubNewsProvider(settings.news_provider_api_key, settings.news_provider_base_url))
-    if settings.macro_provider == "finnhub" and settings.macro_provider_api_key:
-        providers.append(FinnhubMacroProvider(settings.macro_provider_api_key))
+    if not settings.finnhub_api_key:
+        return providers
+    if settings.finnhub_news_enabled:
+        providers.append(FinnhubNewsProvider(settings.finnhub_api_key))
+    calendar_ok = capability_available(session, "finnhub", "economic_calendar") if session is not None else None
+    if settings.finnhub_calendar_enabled and calendar_ok is not False:
+        providers.append(FinnhubMacroProvider(settings.finnhub_api_key))
     return providers
 
 
-def provider_status(settings: Settings) -> dict[str, Any]:
+def provider_status(settings: Settings, session: Session | None = None) -> dict[str, Any]:
+    from app.integrations.health import capability_available
+
+    news = capability_available(session, "finnhub", "crypto_news") if session is not None else None
+    calendar = capability_available(session, "finnhub", "economic_calendar") if session is not None else None
+    verdict = {True: "VERIFIED", False: "UNAVAILABLE", None: "NOT_VERIFIED"}
     return {
-        "news": {
-            "provider": settings.news_provider or None,
-            "configured": bool(settings.news_provider and settings.news_provider_api_key),
-            "credential": "NEWS_PROVIDER_API_KEY",
-        },
-        "macro": {
-            "provider": settings.macro_provider or None,
-            "configured": bool(settings.macro_provider and settings.macro_provider_api_key),
-            "credential": "MACRO_PROVIDER_API_KEY",
-        },
+        "news": {"provider": "finnhub", "configured": bool(settings.finnhub_api_key), "credential": "FINNHUB_API_KEY",
+                 "verification": verdict[news] if settings.finnhub_api_key else "NOT_CONFIGURED"},
+        "macro_calendar": {"provider": "finnhub", "configured": bool(settings.finnhub_api_key), "credential": "FINNHUB_API_KEY",
+                           "verification": verdict[calendar] if settings.finnhub_api_key else "NOT_CONFIGURED"},
+        "macro_series": {"provider": "fred", "configured": bool(settings.fred_api_key), "credential": "FRED_API_KEY",
+                         "verification": verdict[capability_available(session, "fred", "series_observations")]
+                         if settings.fred_api_key and session is not None else ("NOT_CONFIGURED" if not settings.fred_api_key else "NOT_VERIFIED")},
         "manual": {"provider": "operator", "configured": True},
     }
 

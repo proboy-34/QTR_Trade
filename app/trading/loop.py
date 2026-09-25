@@ -8,7 +8,7 @@ from app.core.config import Settings
 from app.core.decimal_math import ONE, ZERO, decimal, money, price
 from app.core.events import Event, EventBus, publish_persisted
 from app.memory.trade_memory import TradeMemoryService
-from app.models import Position, StrategyVersion
+from app.models import Position, PositionEvent, StrategyVersion
 from app.research.dsl import spec_from_version
 from app.trading.pipeline import MarketSnapshot, TradingPipeline, latest_signals
 from app.trading.positions import PositionManager, track_extremes
@@ -42,7 +42,20 @@ class PaperTradingLoop:
 
     async def _close(self, position: Position, mark: Decimal, reason: str, source: str) -> None:
         manager = PositionManager(self.session, self.settings.paper_fee_rate)
-        manager.close(position, self.exit_fill(position, mark), reason)
+        exit_price = self.exit_fill(position, mark)
+        if position.venue == "testnet":
+            from app.execution.binance_testnet import BinanceTestnetExchange
+
+            try:
+                filled = await BinanceTestnetExchange(self.session, self.settings, self.event_bus).close(position, reason)
+            except Exception as exc:  # a failed exit stays visible; the next price update retries it
+                self.session.add(PositionEvent(position_id=position.id, event_type="EXIT_FAILED", from_status=position.status,
+                                               to_status=position.status, price=mark, quantity=position.quantity,
+                                               reason=f"{reason}: {type(exc).__name__}"))
+                self.session.commit()
+                return
+            exit_price = filled or exit_price
+        manager.close(position, exit_price, reason)
         trade = TradeMemoryService(self.session).record(position)
         await publish_persisted(
             self.session, self.event_bus,

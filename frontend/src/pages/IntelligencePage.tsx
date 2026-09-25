@@ -25,7 +25,8 @@ export default function IntelligencePage(){
     <div className="metrics">
       <Metric label="Source-verified events" value={items.filter(i=>i.verification_status==='SOURCE_VERIFIED').length} note="Traceable provider reference"/>
       <Metric label="Unverified" value={items.filter(i=>i.verification_status==='UNVERIFIED').length} note="Never treated as fact"/>
-      <Metric label="News provider" value={providers.data.news?.configured?providers.data.news.provider:'Not configured'} note={providers.data.news?.configured?'Scheduled ingestion':'Set NEWS_PROVIDER + NEWS_PROVIDER_API_KEY'}/>
+      <Metric label="News (Finnhub)" value={providers.data.news?.verification||'—'} note={providers.data.news?.configured?`Economic calendar: ${providers.data.macro_calendar?.verification||'—'}`:'Set FINNHUB_API_KEY on the server'}/>
+      <Metric label="Macro series (FRED)" value={providers.data.macro_series?.verification||'—'} note={providers.data.macro_series?.configured?'Point-in-time vintages (ALFRED)':'Set FRED_API_KEY on the server'}/>
       <Metric label="AI provider" value={ai.data.configured?`${ai.data.provider}`:'Not configured'} note={ai.data.configured?ai.data.model:'Set GEMINI_API_KEY'}/>
     </div>
     <div className="grid two">

@@ -18,7 +18,6 @@ from app.ai.research import AIResearchService
 from app.core.config import Settings
 from app.core.events import EventBus
 from app.global_services.market_intelligence import (
-    CryptoPanicProvider,
     EventNormalizer,
     FinnhubMacroProvider,
     FinnhubNewsProvider,
@@ -33,13 +32,6 @@ NOW = datetime.now(UTC).replace(microsecond=0)
 
 
 def test_provider_payload_parsing_keeps_source_identity():
-    posts = CryptoPanicProvider.parse({"results": [
-        {"id": 77, "title": "Exchange X halts withdrawals after exploit", "published_at": "2026-09-20T10:00:00Z",
-         "original_url": "https://news.test/77", "source": {"title": "NewsTest", "domain": "news.test"},
-         "instruments": [{"code": "BTC"}, {"code": "eth"}]},
-        {"id": None, "title": "missing id"},
-    ]})
-    assert len(posts) == 1 and posts[0].external_id == "77" and posts[0].currencies == ["BTC", "ETH"]
     news = FinnhubNewsProvider.parse([{"id": 5, "headline": "SEC sues exchange", "datetime": 1_758_000_000,
                                        "url": "https://f.test/5", "source": "Reuters", "related": "BTC,COIN"}])
     assert news[0].source_name == "Reuters" and news[0].published_at.tzinfo is not None
@@ -82,9 +74,9 @@ async def test_ingestion_deduplicates_and_updates_macro_actuals(session):
 
 
 def test_no_provider_configured_without_credentials():
-    assert configured_providers(Settings(news_provider="cryptopanic", news_provider_api_key="")) == []
-    assert len(configured_providers(Settings(news_provider="finnhub", news_provider_api_key="k",
-                                             macro_provider="finnhub", macro_provider_api_key="k"))) == 2
+    assert configured_providers(Settings(finnhub_api_key="")) == []
+    assert len(configured_providers(Settings(finnhub_api_key="k"))) == 2
+    assert len(configured_providers(Settings(finnhub_api_key="k", finnhub_calendar_enabled=False))) == 1
 
 
 class FakeProvider:
@@ -249,3 +241,22 @@ async def test_gemini_adapter_request_shape_and_secret_safety():
     with pytest.raises(AIProviderError) as error:
         await provider.generate(AIRequest("T", "system", "fail"))
     assert error.value.retryable and "secret-key-123" not in str(error.value)
+
+
+@pytest.mark.asyncio
+async def test_ai_trade_review_can_only_support_reject_or_fail_honestly(session):
+    rationale = {"asset": "SOLUSDT", "decision_time": NOW.isoformat(), "direction": "LONG",
+                 "supporting_evidence": [{"code": "SETUP", "detail": "EMA cross", "source": "strategy_rule"}],
+                 "contradicting_evidence": [{"code": "BTC_CONTEXT", "detail": "BTC trending down", "source": "regime_engine"}],
+                 "macro_context": {}, "news_context": []}
+    reject = {"summary": "s", "claims": [], "proposals": [{"verdict": "REJECT", "reasons": ["BTC trending down"], "size": 99}]}
+    review = await AIResearchService(session, Settings(), EventBus(), provider=FakeProvider([json.dumps(reject)])).review_trade(rationale)
+    assert review["verdict"] == "REJECT" and "size" not in review  # the AI cannot re-size or re-price
+    odd = {"summary": "s", "claims": [], "proposals": [{"verdict": "BUY MORE"}]}
+    rationale["decision_time"] = (NOW + timedelta(minutes=1)).isoformat()
+    review = await AIResearchService(session, Settings(), EventBus(), provider=FakeProvider([json.dumps(odd)])).review_trade(rationale)
+    assert review["verdict"] == "UNCERTAIN"
+    rationale["decision_time"] = (NOW + timedelta(minutes=2)).isoformat()
+    down = FakeProvider([AIProviderError("400 bad", retryable=False)])
+    review = await AIResearchService(session, Settings(), EventBus(), provider=down).review_trade(rationale)
+    assert review["status"] == "UNAVAILABLE" and review["verdict"] is None  # no fabricated opinion

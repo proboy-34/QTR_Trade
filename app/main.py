@@ -18,40 +18,13 @@ from app.core.notifications import TelegramNotifier
 from app.core.orchestrator import TaskOrchestrator
 from app.core.time import TimeService
 from app.db import SessionLocal, engine, init_db
+from app.integrations.health import system_health
 from app.jobs import JobContext, jobs, run_job
-from app.models import JobExecution, Opportunity, SystemEvent
+from app.models import JobExecution
 from app.seed import seed_demo
 
 started_at = monotonic()
 orchestrator = TaskOrchestrator()
-
-
-async def scheduler_heartbeat() -> None:
-    """The minimal recurring health job; additional jobs register through this boundary."""
-
-
-async def record_scheduled_job(name: str) -> None:
-    with SessionLocal() as session:
-        execution = JobExecution(job_name=name, status="RUNNING")
-        session.add(execution)
-        session.flush()
-        session.add(SystemEvent(
-            type="ScheduledJobCompleted",
-            component="orchestrator",
-            severity="INFO",
-            message=f"{name} completed",
-            payload={"job": name},
-            correlation_id=f"scheduler-{name}",
-        ))
-        if name == "cleanup":
-            session.execute(
-                update(Opportunity)
-                .where(Opportunity.status.in_(["QUEUED", "EVALUATING"]), Opportunity.expires_at < TimeService.now())
-                .values(status="EXPIRED")
-            )
-        execution.status = "COMPLETED"
-        execution.finished_at = TimeService.now()
-        session.commit()
 
 
 def scheduled(context: JobContext, name: str, job: Callable[[Session], Awaitable[dict[str, Any]]]) -> Callable[[], Awaitable[None]]:
@@ -78,15 +51,11 @@ async def lifespan(_: FastAPI):
         )
         session.commit()
     if not orchestrator.states:
-        orchestrator.schedule("health_heartbeat", 60, scheduler_heartbeat)
-        orchestrator.schedule("market_data_health", 60, lambda: record_scheduled_job("market_data_health"))
-        orchestrator.schedule("strategy_refresh", 300, lambda: record_scheduled_job("strategy_refresh"))
-        orchestrator.schedule("reconciliation", 300, lambda: record_scheduled_job("reconciliation"))
-        orchestrator.schedule("cleanup", 3600, lambda: record_scheduled_job("cleanup"))
         context = JobContext(SessionLocal, settings, event_bus, live_paper_service.snapshot)
         initial = {"safety_monitor": 15, "universe_refresh": 10, "market_data_sync": 30, "market_scan": 90,
                    "news_ingestion": 45, "research_queue": 180, "learning": 240, "data_integrity": 600,
-                   "opportunity_cleanup": 600}
+                   "opportunity_cleanup": 600, "provider_verification": 5, "macro_ingestion": 60,
+                   "testnet_reconciliation": 20}
         for name, (interval, job) in jobs(context).items():
             orchestrator.schedule(name, interval, scheduled(context, name, job), initial.get(name))
     notifier = TelegramNotifier(settings)
@@ -140,21 +109,25 @@ app.include_router(router)
 
 @app.get("/health")
 def health() -> dict:
-    with engine.connect() as connection:
-        connection.execute(text("SELECT 1"))
+    """Derived from real checks (providers, data freshness, jobs, database) — never assumed."""
+    settings = get_settings()
+    states = {
+        name: {"enabled": state.enabled, "status": state.status, "runs": state.runs,
+               "last_run": state.last_run, "next_run": state.next_run,
+               "last_error": state.last_error, "skipped_overlaps": state.skipped_overlaps}
+        for name, state in orchestrator.states.items()
+    }
+    with SessionLocal() as session:
+        report = system_health(session, settings, states, live_paper_service.snapshot(), event_bus)
     return {
-        "status": "healthy",
-        "mode": get_settings().trading_mode,
+        "status": report["overall"],
+        "mode": settings.trading_mode,
+        "execution_mode": settings.execution_mode,
+        "data_mode": report["data_mode"],
         "uptime_seconds": round(monotonic() - started_at, 1),
         "event_bus": {"healthy": event_bus.healthy, "published": event_bus.published, "failures": event_bus.failures},
-        "scheduler": {
-            name: {
-                "enabled": state.enabled, "status": state.status, "runs": state.runs,
-                "last_run": state.last_run, "next_run": state.next_run,
-                "last_error": state.last_error, "skipped_overlaps": state.skipped_overlaps,
-            }
-            for name, state in orchestrator.states.items()
-        },
+        "scheduler": states,
+        "components": report["components"],
         "live_paper": live_paper_service.snapshot(),
     }
 

@@ -1,7 +1,17 @@
+# ruff: noqa: E402  (environment must be configured before the app is imported)
 import os
+import tempfile
 
-os.environ["DATABASE_URL"] = "sqlite:///:memory:"
+# The application-level engine uses a real temporary file database (like production), so
+# requests across connections see the same schema. Unit tests use their own in-memory session.
+os.environ["DATABASE_URL"] = f"sqlite:///{tempfile.mkdtemp(prefix='qtr-tests-')}/app.db"
 os.environ["DEMO_MODE"] = "false"
+# Automated tests are deterministic and offline: real credentials from a local .env must never
+# reach them (environment variables take precedence over the .env file).
+for _name in ("BINANCE_API_KEY", "BINANCE_API_SECRET", "BINANCE_TESTNET_API_KEY", "BINANCE_TESTNET_API_SECRET",
+              "GEMINI_API_KEY", "FINNHUB_API_KEY", "FRED_API_KEY", "TELEGRAM_BOT_TOKEN", "AUTH_TOKENS"):
+    os.environ[_name] = ""
+os.environ["EXECUTION_MODE"] = "paper"
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker

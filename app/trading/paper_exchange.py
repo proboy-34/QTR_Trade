@@ -21,6 +21,7 @@ from app.models import (
     PositionEvent,
     TradeIntent,
 )
+from app.trading.accounts import latest_portfolio
 from app.trading.safety import SafetyService
 
 
@@ -58,9 +59,7 @@ class PaperExchange:
             "paper", plan.symbol, decimal(plan.quantity), validation_price
         )
         validation_errors = list(validation.errors)
-        latest = self.session.scalar(
-            select(PortfolioSnapshot).order_by(PortfolioSnapshot.captured_at.desc())
-        )
+        latest = latest_portfolio(self.session, "paper")
         available = decimal(latest.available_balance) if latest else decimal(self.settings.starting_equity)
         leverage = decimal(plan.leverage)
         if leverage <= ZERO:
@@ -198,7 +197,7 @@ class PaperExchange:
                 strategy_version_id=intent.strategy_version_id, symbol=plan.symbol, side=plan.side,
                 quantity=fill_quantity, entry_price=fill_price, current_price=fill_price,
                 highest_price=fill_price, lowest_price=fill_price,
-                stop_loss=plan.stop_loss, take_profit=plan.take_profit, status="OPEN", fees=fee,
+                stop_loss=plan.stop_loss, take_profit=plan.take_profit, status="OPEN", fees=fee, venue="paper",
             )
             self.session.add(position)
             self.session.flush()
@@ -208,11 +207,12 @@ class PaperExchange:
             from_status="OPENING" if opened else "OPEN", to_status="OPEN",
             price=fill_price, quantity=fill_quantity, reason="paper fill",
         ))
-        latest = self.session.scalar(select(PortfolioSnapshot).order_by(PortfolioSnapshot.captured_at.desc()))
+        latest = latest_portfolio(self.session, "paper")
         equity = decimal(latest.equity) if latest else decimal(self.settings.starting_equity)
         available = decimal(latest.available_balance) if latest else equity
         notional = money(fill_quantity * fill_price)
         self.session.add(PortfolioSnapshot(
+            venue="paper",
             equity=money(equity - fee),
             available_balance=money(available - notional / decimal(plan.leverage) - fee),
             exposure=rate((decimal(latest.exposure) if latest else ZERO) + notional / max(equity, ONE)),

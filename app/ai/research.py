@@ -18,7 +18,9 @@ from app.core.config import Settings
 from app.core.events import EventBus
 from app.core.lineage import fingerprint
 from app.core.time import TimeService
+from app.global_services.market_intelligence import knowable_at
 from app.global_services.regime import load_candles
+from app.integrations.fred import macro_as_of
 from app.memory.market_memory import context_features
 from app.memory.trade_memory import base_asset
 from app.models import (
@@ -97,11 +99,14 @@ class AIResearchService:
             registry.add(f"opportunity:{opportunity.id}", "SYSTEM_METRIC", {"signals": opportunity.signals,
                          "rank_score": opportunity.rank_score, "status": opportunity.status}, opportunity.rank_score)
         base = base_asset(symbol)
+        known = knowable_at()
         events = [event for event in self.session.scalars(select(MarketEvent).where(
-            MarketEvent.event_at >= TimeService.now() - timedelta(days=2),
+            known >= TimeService.now() - timedelta(days=2), known <= TimeService.now(),
         ).order_by(desc(MarketEvent.event_at)).limit(200)).all()
             if base in (event.affected_assets or []) or "RISK_ASSETS" in (event.affected_assets or [])][:15]
         self._event_evidence(registry, events)
+        for series_id, item in macro_as_of(self.session, TimeService.now()).items():
+            registry.add(f"macro:{series_id}", "SOURCE_FACT", item, item["value"])
         return registry
 
     # ---------------------------------------------------------------- core
@@ -223,3 +228,36 @@ class AIResearchService:
         return await self._run("DEGRADATION_EXPLANATION", "strategy", strategy_id, registry,
                                f"Suggest possible explanations for the change in performance of strategy '{strategy.name}'. "
                                "These are hypotheses for research, not conclusions.")
+
+    async def review_trade(self, rationale: dict[str, Any]) -> dict[str, Any]:
+        """Second opinion on a TRADE proposal. The AI may only argue for NO_TRADE; it cannot
+        create, enlarge or re-price a trade. Its inputs are exactly QTR's recorded evidence."""
+        registry = EvidenceRegistry()
+        for index, item in enumerate(rationale.get("supporting_evidence", [])):
+            registry.add(f"support:{index}", "SYSTEM_METRIC", item)
+        for index, item in enumerate(rationale.get("contradicting_evidence", [])):
+            registry.add(f"contra:{index}", "SYSTEM_METRIC", item)
+        for series_id, item in (rationale.get("macro_context") or {}).items():
+            registry.add(f"macro:{series_id}", "SOURCE_FACT", item, item.get("value"))
+        events = self.session.scalars(select(MarketEvent).where(MarketEvent.id.in_(rationale.get("news_context") or []))).all()
+        self._event_evidence(registry, list(events))
+        registry.add("proposal", "SYSTEM_METRIC", {key: rationale.get(key) for key in (
+            "asset", "direction", "thesis", "timeframe_roles", "market_regime", "invalidation", "time_horizon", "evidence_strength")})
+        outcome = await self._run(
+            "TRADE_REVIEW", "decision_proposal", f"{rationale.get('asset')}:{rationale.get('decision_time')}", registry,
+            "Review this LONG trade proposal as a disciplined, risk-first trader. Identify evidence that supports it, evidence "
+            "that contradicts it, and anything that would invalidate it. Return exactly one proposal object: "
+            '{"verdict": "SUPPORT" | "REJECT" | "UNCERTAIN", "reasons": [string], "missing_information": [string]}. '
+            "Choose REJECT if contradicting evidence is material. Do not propose prices or sizes.")
+        if outcome.get("status") not in {"OK", "CACHED"}:
+            return {"status": "UNAVAILABLE", "error": outcome.get("error"), "verdict": None,
+                    "fallback": "deterministic evidence rules only (AI review not performed)"}
+        artifact = self.session.get(AIArtifact, outcome["artifact_id"])
+        proposal = next((item for item in (artifact.proposals if artifact else []) if isinstance(item, dict)), {})
+        verdict = str(proposal.get("verdict", "UNCERTAIN")).upper()
+        if verdict not in {"SUPPORT", "REJECT", "UNCERTAIN"}:
+            verdict = "UNCERTAIN"
+        return {"status": outcome["status"], "artifact_id": outcome["artifact_id"], "verdict": verdict,
+                "reasons": [str(reason)[:300] for reason in proposal.get("reasons", [])][:8],
+                "missing_information": [str(item)[:200] for item in proposal.get("missing_information", [])][:8],
+                "verification": artifact.verification if artifact else {}}

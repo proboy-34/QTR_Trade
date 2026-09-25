@@ -6,7 +6,9 @@ QTR is a modular-monolith quantitative research and paper-trading platform. It o
 
 - **Multi-asset universe**: eligibility from live Binance exchange metadata (liquidity, spread, status, filters, data quality, abnormal moves) — no hard-coded coin list.
 - **Market scanner, regimes and memory**: signal detection, ranked/deduplicated opportunities (never trades), evidence-scored regimes with `UNKNOWN` when unclear, similarity search over market history.
-- **Market intelligence**: provider-neutral news/macro (CryptoPanic, Finnhub) as structured, source-verified events.
+- **Market intelligence**: Finnhub news/economic calendar as structured, source-verified events; FRED macro series with point-in-time vintages.
+- **Truthful integrations**: Binance, Gemini, Finnhub and FRED are verified with real requests; results (endpoint, latency, failure reason) are persisted and shown as HEALTHY / DEGRADED / UNAVAILABLE / STALE / NOT CONFIGURED / NOT VERIFIED. Nothing is shown as connected by assumption.
+- **Evidence-based decisions**: every decision stores a structured rationale (supporting / contradicting / blocking evidence, timeframe roles, invalidation, plan, AI review). NO TRADE is a valid outcome.
 - **AI researcher (Gemini)**: budgeted, rate-limited, audited; a hallucination firewall separates facts, interpretation and hypotheses; AI output becomes research artifacts, never orders.
 - **Research engine**: declarative strategy specs (no code execution), IS/OOS/walk-forward, parameter perturbation, cost stress, Monte Carlo, deflated Sharpe with trial counting, passive benchmark, challengers vs champions.
 - **Paper validation and human review**: candidates trade paper money; promotion is an operator decision.
@@ -51,7 +53,7 @@ Open `http://localhost:5173`. API docs are at `http://localhost:8000/docs`.
 
 New screens: **Market overview**, **Opportunities**, **Intelligence**, **Research lab**, **Strategy health**, **Learning**, and **Safety & risk**. All figures come from the database; screens say "not configured" rather than inventing data when a provider or key is missing.
 
-With internet access the scheduler discovers the Binance universe, syncs candles, scans, researches and learns automatically. To try the research engine offline, backfill the synthetic `paper` provider (Market data → Historical backfills) and create a hypothesis in the Research lab with data source "paper".
+With internet access the scheduler discovers the Binance universe, syncs candles, scans, researches and learns automatically. To try the research engine offline, set `DEMO_MODE=true`, backfill the synthetic `paper` provider (Market data → Historical backfills) and create a hypothesis in the Research lab with data source "paper".
 
 ## Docker / PostgreSQL
 
@@ -77,7 +79,7 @@ npm run build
 
 ## Paper trading
 
-The checked-in defaults are `TRADING_MODE=paper` and `LIVE_TRADING_ENABLED=false`. Demo data is visibly marked. From Decision Monitor, select **Evaluate market now** to run the persisted paper pipeline. Backtesting uses the next candle for signal execution and includes fees and slippage.
+The checked-in defaults are `TRADING_MODE=paper`, `EXECUTION_MODE=paper`, `DEMO_MODE=false` and `LIVE_TRADING_ENABLED=false`. Synthetic demo data exists only with `DEMO_MODE=true` and is labelled DEMO everywhere. From Decision Monitor, **Evaluate** runs the persisted pipeline on the latest stored closed candle (the server builds the snapshot; the browser never supplies prices). Backtesting uses the next candle for signal execution and includes fees and slippage.
 
 The paper venue defaults to deterministic immediate fills for repeatable tests. `PAPER_IMMEDIATE_FILL` and `PAPER_PARTIAL_FILL_RATIO` allow queued and partial-fill scenarios without pretending they are live exchange behavior.
 
