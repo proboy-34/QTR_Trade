@@ -1,0 +1,2 @@
+"""QTR modular monolith."""
+
