@@ -582,3 +582,83 @@ def decision_rationale(decision_id: str, session: Session = Depends(get_db)) -> 
         raise NotFoundError("Decision not found")
     return {"decision_id": decision.id, "outcome": decision.outcome, "created_at": decision.created_at,
             "rationale": decision.rationale or {}, "lineage": decision.lineage or {}}
+
+
+# ------------------------------------------------------------------ paper loop visibility
+@router.get("/paper/account")
+def paper_account(session: Session = Depends(get_db)) -> dict:
+    """Paper account derived from positions: real market data, simulated execution, live disabled."""
+    from app.trading.paper_account import PaperAccount
+
+    settings = get_settings()
+    return {**PaperAccount(session, settings).summary(), "live_trading": "DISABLED",
+            "data_mode": "DEMO" if settings.demo_mode else "REAL"}
+
+
+@router.get("/paper/trades")
+def paper_trades(limit: int = Query(50, ge=1, le=500), session: Session = Depends(get_db)) -> dict:
+    from app.models import Order, Position
+
+    positions = session.scalars(select(Position).where(Position.venue == "paper")
+                                .order_by(desc(Position.opened_at)).limit(limit)).all()
+    items = []
+    for position in positions:
+        order = session.scalar(select(Order).where(Order.position_id == position.id).order_by(Order.created_at))
+        items.append({
+            **{key: (str(value) if value is not None and not isinstance(value, (str, int, float, bool)) else value)
+               for key, value in serialize(position).items()},
+            "net_pnl": str(position.realized_pnl - position.fees) if position.status == "CLOSED" else None,
+            "entry_order": {"id": order.id, "execution_mode": order.execution_mode, "market_data_source": order.market_data_source,
+                            "bid": _text(order.bid), "ask": _text(order.ask), "reference_price": _text(order.reference_price),
+                            "slippage_cost": _text(order.slippage_cost), "fees": _text(order.fees), "status": order.status}
+            if order else None,
+        })
+    return {"items": items}
+
+
+@router.get("/candle-cycle/status")
+def candle_cycle_status(limit: int = Query(100, ge=1, le=1000), session: Session = Depends(get_db)) -> dict:
+    from app.models import ProcessedCandle
+
+    rows = session.scalars(select(ProcessedCandle).order_by(desc(ProcessedCandle.processed_at)).limit(limit)).all()
+    last = session.scalar(select(JobExecution).where(JobExecution.job_name == "closed_candle_cycle")
+                          .order_by(desc(JobExecution.started_at)))
+    outcomes = dict(session.execute(select(ProcessedCandle.outcome, func.count()).where(
+        ProcessedCandle.symbol != "__SCAN__").group_by(ProcessedCandle.outcome)).all())
+    return {"websocket_required": False, "mode": "REST closed candles",
+            "last_run": serialize(last) if last else None,
+            "outcome_counts": {str(key): value for key, value in outcomes.items()},
+            "items": [serialize(row) for row in rows]}
+
+
+@router.get("/strategies/lifecycle")
+def strategies_lifecycle(session: Session = Depends(get_db)) -> dict:
+    """Explicit lifecycle: candidate / validated / paper_eligible / active / disabled / rejected."""
+    from app.models import Strategy
+    from app.trading.eligibility import check as eligibility_check
+
+    settings = get_settings()
+    strategies = []
+    for strategy in session.scalars(select(Strategy).order_by(desc(Strategy.created_at))).all():
+        version = max(strategy.versions, key=lambda item: item.version) if strategy.versions else None
+        verdict = eligibility_check(session, settings, version)
+        strategies.append({"id": strategy.id, "name": strategy.name, "symbol": strategy.symbol, "timeframe": strategy.timeframe,
+                           "repository_status": strategy.status, "lifecycle_status": verdict.lifecycle_status,
+                           "paper_eligible": verdict.eligible, "ineligibility_reasons": verdict.reasons,
+                           "passed_methods": verdict.passed_methods, "validated_at": strategy.validated_at,
+                           "validation_summary": strategy.validation_summary, "is_demo": strategy.is_demo})
+    hypotheses = session.scalars(select(Hypothesis).order_by(desc(Hypothesis.updated_at)).limit(200)).all()
+    rejected = [{"id": item.id, "statement": item.statement, "stage": item.stage, "reason": item.decision_reason,
+                 "lifecycle_status": "rejected", "trials": item.trials,
+                 "failed_checks": [name for key in ("backtest", "out_of_sample", "walk_forward", "robustness")
+                                   for name, check in ((item.evidence or {}).get(key) or {}).get("checks", {}).items()
+                                   if not check.get("passed")]}
+                for item in hypotheses if item.stage in ("REJECTED", "FAILED")]
+    in_research = [{"id": item.id, "statement": item.statement, "stage": item.stage, "lifecycle_status": "candidate"}
+                   for item in hypotheses if item.stage not in ("REJECTED", "FAILED", "ARCHIVED", "CANDIDATE", "ACTIVE")]
+    return {"strategies": strategies, "paper_eligible": sum(1 for item in strategies if item["paper_eligible"]),
+            "hypotheses_in_research": in_research, "rejected_hypotheses": rejected}
+
+
+def _text(value: Any) -> str | None:
+    return None if value is None else str(value)

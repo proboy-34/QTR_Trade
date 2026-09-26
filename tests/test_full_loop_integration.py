@@ -24,6 +24,7 @@ from market_fixtures import (
     random_walk,
     store,
 )
+from paper_fixtures import FeedQuotes
 from sqlalchemy import func, select
 from sqlalchemy.orm import sessionmaker
 
@@ -80,7 +81,7 @@ class FixtureAI:
 
 @pytest.mark.asyncio
 async def test_autonomous_research_to_paper_trade_to_learning_loop(session):
-    settings = Settings()
+    settings = Settings(ai_trade_review="off")  # AI decisions are covered by their own tests
     bus = EventBus()
     factory = sessionmaker(bind=session.get_bind(), expire_on_commit=False)
     now = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
@@ -138,10 +139,12 @@ async def test_autonomous_research_to_paper_trade_to_learning_loop(session):
     assert candidate.status == "paper_testing" and candidate.origin == "ai"
 
     # 7. Live-data paper trading on closed candles (public-data feed replayed deterministically).
-    live = LivePaperService(factory, settings, bus)
+    last_close: dict[str, float] = {}
+    live = LivePaperService(factory, settings, bus, quote_provider=FeedQuotes(last_close.get))
     live.state.symbols, live.state.symbol, live.state.provider, live.state.status = ["SOLUSDT"], "SOLUSDT", "binance", "LIVE"
     outcomes = []
     for row in feed.itertuples():
+        last_close["SOLUSDT"] = float(row.close)
         assert await live.ingest_closed_candle(candle_payload(row, "SOLUSDT"))
         outcomes.append(live.state.last_decision)
         closed = session.scalar(select(func.count()).select_from(Position).where(

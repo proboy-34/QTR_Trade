@@ -26,7 +26,7 @@ async def _signed_get(settings: Settings, path: str, transport: httpx.AsyncBaseT
     query = urlencode({"timestamp": int(TimeService.now().timestamp() * 1000), "recvWindow": 5000})
     signature = hmac.new(settings.binance_api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
     started = perf_counter()
-    async with httpx.AsyncClient(base_url=settings.binance_public_base_url, timeout=timeout, transport=transport) as client:
+    async with httpx.AsyncClient(base_url=settings.binance_account_base_url, timeout=timeout, transport=transport) as client:
         response = await client.get(f"{path}?{query}&signature={signature}", headers={"X-MBX-APIKEY": settings.binance_api_key})
     return response.status_code, response.json() if response.content else {}, round((perf_counter() - started) * 1000)
 

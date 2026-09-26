@@ -13,6 +13,9 @@ const responses:Record<string,unknown>={
   '/api/v1/safety':{safe_mode:true,new_orders_blocked:true,active:[{id:'c1',scope:'NEW_ORDERS',target:'*',reason:'Daily loss limit breached',trigger:'EXCESSIVE_DAILY_LOSS',triggered_at:'2026-09-25T10:00:00'}],history:[],real_trading:{trading_mode:'paper',live_trading_enabled:false,live_execution_adapter_installed:false}},
   '/api/v1/portfolio/risk':{gross_exposure:0.12,concentration_hhi:0.5,effective_bets:2,portfolio_beta_to_btc:0.11,correlation:{BTCUSDT:{BTCUSDT:1,ETHUSDT:0.92},ETHUSDT:{BTCUSDT:0.92,ETHUSDT:1}},limits:{max_total_exposure:0.5,max_correlated_exposure:0.35,correlation_threshold:0.7},note:'Correlations use recent returns.'},
   '/api/v1/system/providers':{overall:'UNAVAILABLE',data_mode:'REAL',execution_mode:'paper',real_trading:'DISABLED',scheduler:{},components:{database:{state:'HEALTHY',detail:'sqlite'},binance:{state:'NOT_VERIFIED'},market_data:{state:'UNAVAILABLE',detail:'no binance candles stored'}}},
+  '/api/v1/paper/account':{equity:'99210.03',initial_balance:'100000',cash_available:'99210.03',reserved_capital:'0',unrealized_pnl:'0',realized_pnl:'-600.10',fees_paid:'189.87',slippage_cost:'42.10',cumulative_return_pct:'-0.7897',trades_closed:1,open_positions:0,winning_trades:0,losing_trades:1,max_drawdown:'0.0079',open_exposure:'0',data_mode:'REAL',live_trading:'DISABLED'},
+  '/api/v1/paper/trades':{items:[{id:'p1',opened_at:'2026-09-26T04:00:00Z',symbol:'SOLUSDT',status:'CLOSED',entry_price:'150.10',exit_price:'145.50',exit_reason:'stop_loss',net_pnl:'-600.10',entry_order:{execution_mode:'PAPER',market_data_source:'REAL_BINANCE'}}]},
+  '/api/v1/strategies/lifecycle':{paper_eligible:0,strategies:[],rejected_hypotheses:[{id:'h1'}],hypotheses_in_research:[]},
   '/api/v1/settings':{data_mode:'REAL',execution_mode:'paper',live_paper:{symbol:'BTCUSDT',timeframe:'1h'},risk:{max_drawdown:0.15,max_total_exposure:0.5,max_daily_loss:0.03}},
   '/api/v1/integrations':[{provider:'binance',state:'UNAVAILABLE',checked_at:'2026-09-25T20:17:00+00:00',checks:[{check:'ping',result:'FAILED',latency_ms:12,detail:'ProxyError: 403 Forbidden'}]},{provider:'fred',state:'NOT_VERIFIED',checked_at:null,checks:[]}],
   '/api/v1/decisions':{items:[{id:'d1',symbol:'SOLUSDT',outcome:'WAIT',created_at:'2026-09-25T10:00:00',reasoning:['x'],evaluations:[],rationale:{decision:'NO_TRADE',reason:'blocking evidence: 4h structure TRENDING_DOWN',evidence_strength:0.5,ai_review:{status:'NOT_CONFIGURED'},blocking_evidence:[{code:'HIGHER_TIMEFRAME',detail:'4h structure TRENDING_DOWN',source:'regime_engine'}],contradicting_evidence:[],supporting_evidence:[{code:'SETUP',detail:'EMA cross',source:'strategy_rule'}]}}]},
@@ -104,4 +107,13 @@ test('decision monitor shows NO TRADE with its blocking evidence and no client-s
   expect(await screen.findByText('NO_TRADE')).toBeInTheDocument()
   expect(screen.getByText('Blocking evidence')).toBeInTheDocument()
   expect(screen.getByText('Evaluate BTCUSDT 1h now')).toBeInTheDocument()
+})
+
+test('portfolio shows the derived paper account, provenance and the honest strategy state',async()=>{
+  at('/portfolio')
+  expect(await screen.findByText('Paper account')).toBeInTheDocument()
+  expect(screen.getByText(/REAL MARKET DATA · PAPER EXECUTION/)).toBeInTheDocument()
+  expect(await screen.findByText('PAPER · REAL_BINANCE')).toBeInTheDocument()
+  expect(screen.getByText(/research has not validated any/)).toBeInTheDocument()
+  expect(screen.getByText(/1 hypotheses rejected/)).toBeInTheDocument()
 })

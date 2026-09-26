@@ -116,7 +116,9 @@ class LivePaperService:
         settings: Settings,
         event_bus: EventBus,
         stream: LiveCandleStream | None = None,
+        quote_provider: Any = None,
     ) -> None:
+        self.quote_provider = quote_provider
         self.session_factory = session_factory
         self.settings = settings
         self.event_bus = event_bus
@@ -417,7 +419,7 @@ class LivePaperService:
             timeframe=self.state.timeframe, market_regime=regime.regime,
             liquidity=liquidity_state(session, self.state.provider, symbol),
         )
-        return await PaperTradingLoop(session, self.settings, self.event_bus).process(snapshot)
+        return await PaperTradingLoop(session, self.settings, self.event_bus, self.quote_provider).process(snapshot)
 
     async def _monitor_price(self, price_value: float, symbol: str | None = None) -> None:
         with self.session_factory() as session:

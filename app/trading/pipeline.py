@@ -13,6 +13,7 @@ from app.core.time import TimeService
 from app.global_services.historical import TIMEFRAME_DELTA
 from app.global_services.market_data import MarketDataQuality
 from app.global_services.market_intelligence import knowable_at
+from app.global_services.quotes import BinanceQuoteProvider, Quote, QuoteProvider
 from app.global_services.regime import candles_frame
 from app.global_services.universe import UniverseService
 from app.memory.trade_memory import base_asset
@@ -26,12 +27,14 @@ from app.models import (
     MarketRegimeRecord,
     Opportunity,
     PortfolioSnapshot,
+    Position,
     Strategy,
     StrategyVersion,
     TradeIntent,
 )
 from app.research.dsl import CompiledStrategy, StrategySpec, spec_from_version
 from app.trading.accounts import venue_for
+from app.trading.eligibility import check as eligibility_check
 from app.trading.paper_exchange import PaperExchange
 from app.trading.reasoning import DecisionReasoner
 from app.trading.risk import MarketFacts, RiskEngine
@@ -64,16 +67,23 @@ def strategy_covers(strategy: Strategy, version: StrategyVersion, symbol: str, e
     return strategy.symbol == symbol or symbol in universe or ("ELIGIBLE" in universe and symbol in eligible)
 
 
+def closed_before(at: datetime, timeframe: str) -> datetime:
+    """Latest candle OPEN time whose candle had closed by `at` (no look-ahead into a forming candle)."""
+    return TimeService.ensure_utc(at) - TIMEFRAME_DELTA.get(timeframe, timedelta(hours=1))
+
+
 def latest_signals(session: Session, spec: StrategySpec, snapshot: MarketSnapshot) -> tuple[dict[str, bool] | None, str]:
     """Entry/exit flags of a specification on the latest stored closed candle at snapshot time."""
     compiled = CompiledStrategy(spec)
+    interval = TIMEFRAME_DELTA.get(snapshot.timeframe, timedelta(hours=1))
+    # Candle timestamps are OPEN times: only candles that had CLOSED by the decision time count.
+    closed_by = closed_before(snapshot.observed_at, snapshot.timeframe)
     rows = session.scalars(select(MarketCandle).where(
         MarketCandle.exchange == snapshot.exchange, MarketCandle.symbol == snapshot.symbol,
-        MarketCandle.timeframe == snapshot.timeframe, MarketCandle.timestamp <= snapshot.observed_at,
+        MarketCandle.timeframe == snapshot.timeframe, MarketCandle.timestamp <= closed_by,
     ).order_by(desc(MarketCandle.timestamp)).limit(max(400, compiled.warmup() + 5))).all()
     if len(rows) < compiled.warmup() + 2:
         return None, "insufficient_candles"
-    interval = TIMEFRAME_DELTA.get(snapshot.timeframe, timedelta(hours=1))
     if TimeService.ensure_utc(snapshot.observed_at) - TimeService.ensure_utc(rows[0].timestamp) > interval * 3:
         return None, "stale_candles"
     flags = compiled.signals(candles_frame(list(reversed(rows)))).iloc[-1]
@@ -83,22 +93,49 @@ def latest_signals(session: Session, spec: StrategySpec, snapshot: MarketSnapsho
 class TradingPipeline:
     """Coordinates layers while keeping each layer's question and output distinct."""
 
-    def __init__(self, session: Session, settings: Settings, event_bus: EventBus) -> None:
+    def __init__(self, session: Session, settings: Settings, event_bus: EventBus,
+                 quote_provider: QuoteProvider | None = None, ai_provider: Any = None) -> None:
         self.session, self.settings, self.event_bus = session, settings, event_bus
+        self.quote_provider = quote_provider
+        self.ai_provider = ai_provider
 
     def _entry_signal(self, strategy: Strategy, version: StrategyVersion, snapshot: MarketSnapshot) -> tuple[bool | None, str]:
-        """Evaluate a declarative entry rule on stored closed candles known at decision time."""
+        """Evaluate a declarative entry rule on stored closed candles known at decision time.
+
+        Outside DEMO_MODE there is no fallback: without a declarative rule or enough closed
+        candles there is no entry signal (the legacy 'direction' heuristic is demo-only).
+        """
         spec = spec_from_version(version, strategy)
+        demo = self.settings.demo_mode
         if spec is None:
-            return None, "legacy_direction"
+            return (None, "legacy_direction") if demo else (False, "no_declarative_rule")
         if snapshot.timeframe not in spec.timeframes:
             return False, "timeframe_not_supported"
         signals, status = latest_signals(self.session, spec, snapshot)
         if signals is None:
-            return (False, status) if status == "stale_candles" else (None, "legacy_direction_insufficient_candles")
+            if status == "stale_candles" or not demo:
+                return False, status
+            return None, "legacy_direction_insufficient_candles"
         return bool(signals["entry"]), "declarative_rule"
 
-    async def evaluate(self, snapshot: MarketSnapshot, force_signal: bool = False) -> dict:
+    async def _quote(self, snapshot: MarketSnapshot) -> tuple[Quote | None, list[str]]:
+        """Real bid/ask for execution. The paper (demo) exchange has none; errors are reported, never filled in."""
+        if snapshot.exchange == "paper":
+            return None, []
+        provider = self.quote_provider or (BinanceQuoteProvider(self.settings.binance_public_base_url)
+                                           if snapshot.exchange == "binance" else None)
+        if provider is None:
+            return None, [f"no quote provider for {snapshot.exchange}"]
+        try:
+            return await provider.quote(snapshot.symbol), []
+        except ConnectionError as exc:
+            return None, [str(exc)[:200]]
+
+    async def evaluate(self, snapshot: MarketSnapshot, force_signal: bool = False,
+                       inputs: dict[str, Any] | None = None) -> dict:
+        """`inputs` carries caller evidence (candle identity, scanner evidence, provider errors)."""
+        context_in = inputs or {}
+        force_signal = force_signal and self.settings.demo_mode
         correlation_id = str(uuid4())
         try:
             MarketDataQuality().validate_snapshot(snapshot.price, snapshot.volume, snapshot.observed_at)
@@ -120,6 +157,7 @@ class TradingPipeline:
             regime_record = self.session.scalar(select(MarketRegimeRecord).where(
                 MarketRegimeRecord.exchange == snapshot.exchange, MarketRegimeRecord.symbol == snapshot.symbol,
                 MarketRegimeRecord.timeframe == snapshot.timeframe,
+                MarketRegimeRecord.candle_timestamp <= closed_before(snapshot.observed_at, snapshot.timeframe),
             ).order_by(desc(MarketRegimeRecord.candle_timestamp)))
             snapshot.market_regime = regime_record.regime if regime_record else None
         context = self._remember_context(snapshot)
@@ -145,9 +183,13 @@ class TradingPipeline:
             signal, signal_source = self._entry_signal(strategy, version, snapshot)
             direction_ok = snapshot.direction == "BULLISH" if signal is None else signal
             liquidity_ok = snapshot.liquidity == "STRONG"
-            score = int(regime_ok) * 45 + int(direction_ok) * 35 + int(liquidity_ok) * 20
-            eligible = regime_ok and liquidity_ok and score >= 75
+            paper = eligibility_check(self.session, self.settings, version)
+            checks = {"paper_eligible": paper.eligible, "regime_match": regime_ok,
+                      "entry_signal": bool(direction_ok), "liquidity_strong": liquidity_ok}
+            score = round(100 * sum(checks.values()) / len(checks))  # share of conditions met (not a probability)
+            eligible = paper.eligible and regime_ok and liquidity_ok
             reasons = [
+                f"paper_eligible={paper.eligible}" + (f" ({'; '.join(paper.reasons)})" if paper.reasons else ""),
                 f"regime_match={regime_ok}",
                 f"entry_signal={direction_ok}" if signal is not None else f"direction_bullish={direction_ok}",
                 f"liquidity_strong={liquidity_ok}",
@@ -183,6 +225,7 @@ class TradingPipeline:
                 "strategy_version_id": version.id,
                 "content_hash": version.content_hash,
                 "signal_source": signal_source,
+                "lifecycle_status": paper.lifecycle_status,
             })
             if opportunity.status == "SELECTED":
                 selected = strategy, version, opportunity
@@ -192,10 +235,16 @@ class TradingPipeline:
             strategy_selected, version_selected, opportunity_selected = selected
             source = next(item["signal_source"] for item in evaluations if item["opportunity_id"] == opportunity_selected.id)
             rationale = DecisionReasoner(self.session, self.settings).assess(snapshot, strategy_selected, version_selected, source)
+            rationale.update({key: context_in[key] for key in ("candle", "scanner_evidence") if key in context_in})
             if rationale["decision"] == "TRADE_PROPOSAL":
                 rationale["ai_review"] = await self._ai_review(rationale)
                 review = rationale["ai_review"]
-                if self.settings.ai_trade_review == "veto" and review.get("verdict") == "REJECT":
+                mode = self.settings.ai_trade_review
+                if mode == "required" and review.get("decision") != "TRADE":
+                    detail = review.get("error") or "; ".join(review.get("validation_problems") or review.get("reasons") or []) or "no decision"
+                    rationale["decision"] = "NO_TRADE"
+                    rationale["reason"] = f"Gemini decision required: {review.get('status')} / {review.get('ai_decision') or review.get('decision')} ({detail[:200]})"
+                elif mode == "veto" and review.get("verdict") == "REJECT":
                     rationale["decision"], rationale["reason"] = "NO_TRADE", "AI review identified material contradicting evidence (veto mode)"
             if rationale["decision"] == "NO_TRADE":
                 opportunity_selected.status = "REJECTED"
@@ -254,8 +303,11 @@ class TradingPipeline:
             from app.execution.binance_testnet import BinanceTestnetExchange
 
             await BinanceTestnetExchange(self.session, self.settings, self.event_bus).sync_portfolio()
+        quote, quote_errors = await self._quote(snapshot)
         facts = MarketFacts(snapshot.exchange, snapshot.timeframe, snapshot.observed_at,
-                            self._last_candle_at(snapshot)) if self._has_candles(snapshot) else None
+                            self._last_candle_at(snapshot), quote=quote, require_quote=snapshot.exchange != "paper",
+                            provider_errors=[*context_in.get("provider_errors", []), *quote_errors],
+                            ) if self._has_candles(snapshot) else None
         assessment = RiskEngine(self.session, self.settings, venue).assess(
             intent, snapshot.price, snapshot.volatility, facts
         )
@@ -271,7 +323,8 @@ class TradingPipeline:
                 ),
                 "portfolio_risk",
             )
-            decision.rationale = {**rationale, "risk": {"outcome": "REJECTED", "reasons": assessment.reason_codes}}
+            decision.rationale = {**rationale, "risk": {"outcome": "REJECTED", "reasons": assessment.reason_codes,
+                                                        "quote": _quote_dict(quote)}}
             self.session.commit()
             return {
                 "decision_id": decision.id,
@@ -295,9 +348,9 @@ class TradingPipeline:
         )
         self.session.add(plan)
         self.session.flush()
-        entry = float(snapshot.price)
+        entry = float(quote.ask) if quote is not None else float(snapshot.price)
         stop, target = float(assessment.stop_loss), float(assessment.take_profit)
-        decision.rationale = {**rationale, "risk": {"outcome": "APPROVED"}, "plan": {
+        decision.rationale = {**rationale, "risk": {"outcome": "APPROVED", "quote": _quote_dict(quote)}, "plan": {
             "venue": venue, "entry_reference": entry, "stop_loss": stop, "take_profit": [target],
             "expected_reward_risk": round((target - entry) / (entry - stop), 3) if entry > stop else None,
             "quantity": str(assessment.quantity), "notional": str(assessment.notional),
@@ -315,10 +368,22 @@ class TradingPipeline:
             execution = await BinanceTestnetExchange(self.session, self.settings, self.event_bus).submit(
                 plan, intent, snapshot.price, correlation_id)
         else:
-            execution = await PaperExchange(self.session, self.settings, self.event_bus).submit(
+            execution = await PaperExchange(self.session, self.settings, self.event_bus, quote=quote,
+                                            instrument_exchange=snapshot.exchange).submit(
                 plan, intent, snapshot.price, correlation_id
             )
         intent.status = "executed" if execution.get("position_id") else "submitted"
+        position = self.session.get(Position, execution["position_id"]) if execution.get("position_id") else None
+        if position is not None and position.timeframe is None:
+            # Monitoring state: the decision candle is already known; REST monitoring starts after it.
+            risk_spec = (rationale.get("strategy_risk") or {})
+            candle = context_in.get("candle") or {}
+            position.timeframe, position.market_exchange = snapshot.timeframe, snapshot.exchange
+            position.max_holding_bars = risk_spec.get("max_holding_bars")
+            position.decision_id = decision.id
+            opened_candle = candle.get("open_time") or self._last_candle_at(snapshot)
+            position.last_evaluated_candle_at = (datetime.fromisoformat(opened_candle) if isinstance(opened_candle, str)
+                                                 else opened_candle)
         self.session.commit()
         return {
             "decision_id": decision.id,
@@ -335,7 +400,7 @@ class TradingPipeline:
         from app.ai.providers import build_provider
         from app.ai.research import AIResearchService
 
-        provider = build_provider(self.settings)
+        provider = self.ai_provider or build_provider(self.settings)
         if not provider.configured:
             return {"status": "NOT_CONFIGURED", "verdict": None,
                     "fallback": "deterministic evidence rules only (AI review not performed)"}
@@ -349,7 +414,7 @@ class TradingPipeline:
         return self.session.scalar(select(MarketCandle.timestamp).where(
             MarketCandle.exchange == snapshot.exchange, MarketCandle.symbol == snapshot.symbol,
             MarketCandle.timeframe == snapshot.timeframe,
-            MarketCandle.timestamp <= TimeService.ensure_utc(snapshot.observed_at),
+            MarketCandle.timestamp <= closed_before(snapshot.observed_at, snapshot.timeframe),
         ).order_by(desc(MarketCandle.timestamp)))
 
     def _remember_context(self, snapshot: MarketSnapshot) -> MarketContextRecord:
@@ -417,7 +482,8 @@ class TradingPipeline:
         portfolio = self.session.scalar(select(PortfolioSnapshot).order_by(PortfolioSnapshot.captured_at.desc()))
         last_candle = self.session.scalar(select(MarketCandle.timestamp).where(
             MarketCandle.exchange == snapshot.exchange, MarketCandle.symbol == snapshot.symbol,
-            MarketCandle.timeframe == snapshot.timeframe, MarketCandle.timestamp <= observed,
+            MarketCandle.timeframe == snapshot.timeframe,
+            MarketCandle.timestamp <= closed_before(observed, snapshot.timeframe),
         ).order_by(desc(MarketCandle.timestamp)))
         base = base_asset(snapshot.symbol)
         # Only information knowable at decision time (no look-ahead).
@@ -430,6 +496,7 @@ class TradingPipeline:
         regime = self.session.scalar(select(MarketRegimeRecord.id).where(
             MarketRegimeRecord.exchange == snapshot.exchange, MarketRegimeRecord.symbol == snapshot.symbol,
             MarketRegimeRecord.timeframe == snapshot.timeframe,
+            MarketRegimeRecord.candle_timestamp <= closed_before(observed, snapshot.timeframe),
         ).order_by(desc(MarketRegimeRecord.candle_timestamp)))
         artifacts = self.session.scalars(select(AIArtifact.id).where(
             AIArtifact.subject_id == snapshot.symbol, AIArtifact.created_at >= observed - timedelta(hours=24),
@@ -448,3 +515,10 @@ class TradingPipeline:
             "ai_artifact_ids": list(artifacts),
             "ai_role": "context only; AI output never selects trades",
         }
+
+
+def _quote_dict(quote: Quote | None) -> dict[str, Any] | None:
+    if quote is None:
+        return None
+    return {"source": quote.source, "bid": str(quote.bid), "ask": str(quote.ask),
+            "spread_bps": round(float(quote.spread_bps), 3), "observed_at": quote.observed_at.isoformat()}

@@ -55,6 +55,8 @@ class Settings(BaseSettings):
     # market-data-only host; it serves no account or order endpoints.
     binance_public_base_url: str = "https://data-api.binance.vision"
     binance_ws_base_url: str = "wss://stream.binance.com:9443"
+    # Authenticated read-only account checks only (the market-data host serves no account endpoints).
+    binance_account_base_url: str = "https://api.binance.com"
     universe_quote_assets: str = "USDT"
     universe_min_quote_volume_24h: float = Field(20_000_000, ge=0)
     universe_max_spread_bps: float = Field(15, gt=0)
@@ -72,6 +74,15 @@ class Settings(BaseSettings):
     scanner_interval_seconds: int = Field(300, ge=30)
     market_sync_enabled: bool = True
     market_sync_interval_seconds: int = Field(300, ge=30)
+    # Closed candles kept per eligible asset for research (IS/OOS/walk-forward need depth).
+    research_history_candles: int = Field(2000, ge=300, le=20_000)
+    # REST closed-candle loop (the core paper loop; no WebSocket required).
+    candle_cycle_enabled: bool = True
+    candle_cycle_interval_seconds: int = Field(60, ge=15)
+    # Seconds after a candle closes before it is treated as final (exchange publication lag).
+    candle_close_grace_seconds: int = Field(5, ge=0, le=300)
+    # Real bid/ask must be at most this old when a paper order is filled.
+    quote_max_age_seconds: int = Field(30, ge=1, le=600)
     opportunity_ttl_minutes: int = Field(240, ge=5)
 
     # Market intelligence (news / macro). Empty provider = manual events only.
@@ -93,8 +104,12 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     # Verified 2026-09-25: gemini-2.5-flash is listed but no longer serves new keys.
     gemini_model: str = "gemini-3.8-flash"
-    # AI review of TRADE proposals: off, advisory (recorded only) or veto (may turn TRADE into NO_TRADE).
-    ai_trade_review: Literal["off", "advisory", "veto"] = "advisory"
+    # AI decision on TRADE proposals:
+    #   required (default): a paper order needs a structured Gemini TRADE decision; any AI failure,
+    #                       malformed answer or NO_TRADE yields NO_TRADE (AI can never force a trade)
+    #   veto:     an AI NO_TRADE blocks; AI unavailability falls back to the deterministic rules
+    #   advisory: recorded only;  off: not called
+    ai_trade_review: Literal["off", "advisory", "veto", "required"] = "required"
     gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
     ai_timeout_seconds: float = Field(30, gt=0, le=300)
     ai_max_retries: int = Field(2, ge=0, le=5)

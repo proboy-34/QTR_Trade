@@ -155,11 +155,15 @@ def candles_frame(rows: list[MarketCandle]) -> pd.DataFrame:
     return frame
 
 
-def load_candles(session: Session, exchange: str, symbol: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
-    rows = session.scalars(select(MarketCandle).where(
-        MarketCandle.exchange == exchange, MarketCandle.symbol == symbol,
-        MarketCandle.timeframe == timeframe,
-    ).order_by(desc(MarketCandle.timestamp)).limit(limit)).all()
+def load_candles(session: Session, exchange: str, symbol: str, timeframe: str, limit: int = 300,
+                 until: datetime | None = None) -> pd.DataFrame:
+    """Latest `limit` candles; with `until`, only candles that opened at or before it (point in time)."""
+    query = select(MarketCandle).where(
+        MarketCandle.exchange == exchange, MarketCandle.symbol == symbol, MarketCandle.timeframe == timeframe,
+    )
+    if until is not None:
+        query = query.where(MarketCandle.timestamp <= until)
+    rows = session.scalars(query.order_by(desc(MarketCandle.timestamp)).limit(limit)).all()
     return candles_frame(list(reversed(rows)))
 
 

@@ -34,6 +34,19 @@ Research code writes candidate strategies and immutable versions to the reposito
 
 The live-paper coordinator bootstraps public Binance history, consumes validated closed WebSocket candles (one symbol or a combined multi-asset stream), updates the regime history, runs Decision only for a matching strategy timeframe, applies the strategy's declarative exit rule on closed candles, and monitors stored stops/targets from live prices. Exits fill with slippage and half-spread against the position; gaps fill at the observed price. Impossible price jumps are rejected and halt the asset.
 
+## REST closed-candle paper loop (migration `0007`)
+
+`app/trading/candle_cycle.py` is the core autonomous loop (scheduled job `closed_candle_cycle`, every 60 s). It does not need WebSocket or Binance credentials:
+
+1. latest fully closed candle per timeframe (`last_closed_open`; the forming candle and a 5 s publication grace are excluded);
+2. sync closed candles from Binance REST (`data-api.binance.vision`) for eligible assets and assets with open positions;
+3. monitor open paper positions candle by candle (conservative OHLC rule: gap -> open, stop and target in one candle -> stop, target -> target without price improvement; strategy exit and maximum holding period at the close), then mark to the real bid and enforce stop/target on it;
+4. scan once per candle (ledger marker);
+5. per asset, claim the candle in `processed_candles` (unique exchange + symbol + timeframe + open time) and run the pipeline at the candle close time: regime (plus 4h context resampled from closed 1h candles) -> paper-eligible strategies -> evidence reasoner -> Gemini structured decision (`AI_TRADE_REVIEW=required`) -> deterministic Risk (with the real bid/ask) -> paper fill at the real ask + slippage;
+6. recompute the paper account from positions (`app/trading/paper_account.py`).
+
+A claimed candle is never replayed (an interrupted claim is marked `INTERRUPTED`), so restarts cannot duplicate decisions, orders, positions or exits. Paper orders carry `execution_mode="PAPER"` and `market_data_source` (`REAL_BINANCE` for real quotes) plus bid, ask, reference price and slippage cost. The WebSocket live-paper service remains as optional functionality.
+
 ## Decision evidence, venues and truthful health (migration `0006`)
 
 - `app/trading/reasoning.py` turns a strategy setup into a structured rationale before Risk: timeframe roles (higher timeframe = context and may block; setup timeframe = regime/setup/entry; Risk = size/stop/target; exits = strategy rule + stop/target), supporting / contradicting / blocking evidence, invalidation, horizon, macro context (FRED as-of), news context, historical analogues, data sources and the risk-configuration fingerprint. Only evidence knowable at the decision time is used (`knowable_at` = `available_at`, else `published_at`, else `event_at`). The rationale is stored on `Decision.rationale`, together with the Risk outcome and the approved plan.

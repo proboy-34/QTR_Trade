@@ -31,7 +31,7 @@ class AITaskRequest(BaseModel):
 
 
 class SafetyControlCreate(BaseModel):
-    scope: Literal["SYSTEM", "PAPER_TRADING", "NEW_ORDERS", "STRATEGY", "ASSET"]
+    scope: Literal["EMERGENCY", "SYSTEM", "PAPER_TRADING", "NEW_ORDERS", "STRATEGY", "ASSET"]
     target: str = Field("*", max_length=100)
     reason: str = Field(min_length=3, max_length=1000)
 

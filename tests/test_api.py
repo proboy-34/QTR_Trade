@@ -41,3 +41,17 @@ def test_seed_demo_refuses_outside_demo_mode():
 
     with pytest.raises(RuntimeError, match='DEMO_MODE'):
         seed_demo(None, Settings(demo_mode=False))
+
+
+def test_paper_loop_endpoints_serialize():
+    with TestClient(app) as client:
+        account = client.get('/api/v1/paper/account')
+        assert account.status_code == 200
+        body = account.json()
+        assert body['execution_mode'] == 'PAPER' and body['live_trading'] == 'DISABLED' and 'equity' in body
+        for path in ('/api/v1/paper/trades', '/api/v1/candle-cycle/status', '/api/v1/strategies/lifecycle'):
+            response = client.get(path)
+            assert response.status_code == 200, path
+        assert client.get('/api/v1/candle-cycle/status').json()['websocket_required'] is False
+        components = client.get('/health').json()['components']
+        assert components['binance_account']['state'] == 'NOT_CONFIGURED'  # no secret: never blocks paper trading

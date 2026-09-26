@@ -38,23 +38,36 @@ class PostTradeAnalyst:
             "decision_confidence": decision.confidence if decision else None,
             "research_expectancy_pct": (validation.metrics or {}).get("expectancy_pct") if validation else None,
         }
+        rationale = (decision.rationale or {}) if decision else {}
+        expected.update({
+            "planned": {"entry": str(trade.entry_price), "stop_loss": str(trade.stop_loss), "take_profit": str(trade.take_profit)},
+            "strategy": rationale.get("strategy"), "regime": rationale.get("market_regime"),
+            "thesis": rationale.get("thesis"), "invalidation": rationale.get("invalidation"),
+            "ai_decision": {key: (rationale.get("ai_review") or {}).get(key) for key in (
+                "status", "decision", "confidence", "thesis", "invalidation", "reasons", "artifact_id")},
+            "risk_decision": rationale.get("risk"), "market_conditions": rationale.get("candle"),
+        })
         mfe, mae = trade.mfe_pct or 0.0, trade.mae_pct or 0.0
         actual = {
             "exit_reason": trade.exit_reason, "return_pct": round(trade.return_pct, 4),
             "r_multiple": round(trade.r_multiple, 3) if trade.r_multiple is not None else None,
             "mfe_pct": round(mfe, 4), "mae_pct": round(mae, 4), "holding_hours": round(trade.holding_seconds / 3600, 3),
             "net_pnl": str(trade.net_pnl), "fees": str(trade.fees), "slippage_cost": str(trade.slippage_cost),
+            "exit_price": str(trade.exit_price) if getattr(trade, "exit_price", None) is not None else None,
+            "execution_quality": {"slippage_pct_of_notional": round(float(trade.slippage_cost) / (float(trade.entry_price) * float(trade.quantity)) * 100, 5)
+                                  if float(trade.entry_price) * float(trade.quantity) else None,
+                                  "fills": "SIMULATED against real Binance quotes (paper)"},
         }
         thesis: bool | None
         if trade.exit_reason == "take_profit" or (stop_pct and mfe >= stop_pct):
             thesis = True
-        elif trade.exit_reason == "stop_loss" and mfe < stop_pct * 0.5:
+        elif str(trade.exit_reason).startswith("stop_loss") and mfe < stop_pct * 0.5:
             thesis = False
         else:
             thesis = None
         if stop_pct and abs(min(mae, 0)) < stop_pct * 0.5:
             entry_quality = "GOOD"
-        elif trade.exit_reason == "stop_loss" and mfe < stop_pct * 0.25:
+        elif str(trade.exit_reason).startswith("stop_loss") and mfe < stop_pct * 0.25:
             entry_quality = "POOR_IMMEDIATELY_ADVERSE"
         else:
             entry_quality = "AVERAGE"
@@ -109,7 +122,7 @@ class PostTradeAnalyst:
         notional = float(trade.entry_price) * float(trade.quantity)
         if notional and float(trade.slippage_cost) / notional > 0.001:
             factors.append("ADVERSE_ENTRY_SLIPPAGE")
-        if trade.exit_reason == "stop_loss" and trade.return_pct < -(stop_pct * 1.1):
+        if str(trade.exit_reason).startswith("stop_loss") and trade.return_pct < -(stop_pct * 1.1):
             factors.append("GAP_THROUGH_STOP")
         gross = float(trade.realized_pnl)
         if gross > 0 and float(trade.net_pnl) <= 0:

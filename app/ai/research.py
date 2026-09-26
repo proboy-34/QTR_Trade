@@ -5,7 +5,7 @@ answer in typed claims. Its output becomes an AIArtifact; proposals become hypot
 that still face every quantitative gate. The AI has no path to decisions or orders.
 """
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import desc, select
@@ -18,6 +18,7 @@ from app.core.config import Settings
 from app.core.events import EventBus
 from app.core.lineage import fingerprint
 from app.core.time import TimeService
+from app.global_services.historical import TIMEFRAME_DELTA
 from app.global_services.market_intelligence import knowable_at
 from app.global_services.regime import load_candles
 from app.integrations.fred import macro_as_of
@@ -77,23 +78,31 @@ class AIResearchService:
                 "expected": event.expected_value, "actual": event.actual_value, "surprise": event.surprise,
             })
 
-    def market_evidence(self, exchange: str, symbol: str, timeframe: str) -> EvidenceRegistry:
+    def market_evidence(self, exchange: str, symbol: str, timeframe: str, at: datetime | None = None) -> EvidenceRegistry:
+        """Evidence knowable at `at` (default: now). Nothing newer than `at` is ever included."""
         registry = EvidenceRegistry()
-        frame = load_candles(self.session, exchange, symbol, timeframe, 300)
+        at = TimeService.ensure_utc(at) if at else TimeService.now()
+        interval = TIMEFRAME_DELTA.get(timeframe, timedelta(hours=1))
+        frame = load_candles(self.session, exchange, symbol, timeframe, 300, until=at - interval)
         if not frame.empty:
             registry.add("metric:last_close", "SYSTEM_METRIC", {"symbol": symbol, "close": float(frame["close"].iloc[-1]),
-                         "candle_at": str(frame["timestamp"].iloc[-1])}, float(frame["close"].iloc[-1]))
+                         "candle_open_at": str(frame["timestamp"].iloc[-1])}, float(frame["close"].iloc[-1]))
+            recent = frame.tail(6)
+            registry.add("metric:recent_candles", "SYSTEM_METRIC", {"closed_candles": [
+                {"open_at": str(row.timestamp), "open": float(row.open), "high": float(row.high), "low": float(row.low),
+                 "close": float(row.close), "volume": float(row.volume)} for row in recent.itertuples()]})
             for key, value in context_features(frame).items():
                 if value is not None:
                     registry.add(f"metric:{key}", "SYSTEM_METRIC", {"feature": key, "value": value}, value)
         regime = self.session.scalar(select(MarketRegimeRecord).where(
             MarketRegimeRecord.exchange == exchange, MarketRegimeRecord.symbol == symbol, MarketRegimeRecord.timeframe == timeframe,
+            MarketRegimeRecord.candle_timestamp <= at - interval,
         ).order_by(desc(MarketRegimeRecord.candle_timestamp)))
         if regime:
             registry.add(f"regime:{regime.id}", "SYSTEM_METRIC", {"regime": regime.regime, "confidence": regime.confidence,
                          "previous": regime.previous_regime, "candle_at": regime.candle_timestamp}, regime.confidence)
         opportunity = self.session.scalar(select(Opportunity).where(
-            Opportunity.source == "scanner", Opportunity.symbol == symbol,
+            Opportunity.source == "scanner", Opportunity.symbol == symbol, Opportunity.created_at <= at,
         ).order_by(desc(Opportunity.created_at)))
         if opportunity:
             registry.add(f"opportunity:{opportunity.id}", "SYSTEM_METRIC", {"signals": opportunity.signals,
@@ -101,11 +110,11 @@ class AIResearchService:
         base = base_asset(symbol)
         known = knowable_at()
         events = [event for event in self.session.scalars(select(MarketEvent).where(
-            known >= TimeService.now() - timedelta(days=2), known <= TimeService.now(),
+            known >= at - timedelta(days=2), known <= at,
         ).order_by(desc(MarketEvent.event_at)).limit(200)).all()
             if base in (event.affected_assets or []) or "RISK_ASSETS" in (event.affected_assets or [])][:15]
         self._event_evidence(registry, events)
-        for series_id, item in macro_as_of(self.session, TimeService.now()).items():
+        for series_id, item in macro_as_of(self.session, at).items():
             registry.add(f"macro:{series_id}", "SOURCE_FACT", item, item["value"])
         return registry
 
@@ -230,9 +239,18 @@ class AIResearchService:
                                "These are hypotheses for research, not conclusions.")
 
     async def review_trade(self, rationale: dict[str, Any]) -> dict[str, Any]:
-        """Second opinion on a TRADE proposal. The AI may only argue for NO_TRADE; it cannot
-        create, enlarge or re-price a trade. Its inputs are exactly QTR's recorded evidence."""
-        registry = EvidenceRegistry()
+        """Structured AI trade decision on a deterministic TRADE proposal.
+
+        Gemini sees only evidence knowable at the decision time and must answer with one
+        structured object (decision, direction, entry, stop_loss, take_profit, thesis,
+        invalidation, confidence, evidence). It can recommend; it cannot execute, size or
+        bypass Risk. Any failure or malformed answer is reported as such and treated as NO_TRADE
+        by the caller in `required` mode — no answer is ever fabricated.
+        """
+        at = datetime.fromisoformat(str(rationale.get("decision_time"))) if rationale.get("decision_time") else None
+        exchange = rationale.get("exchange") or self.settings.scanner_exchange
+        timeframe = (rationale.get("timeframe_roles") or {}).get("setup") or "1h"
+        registry = self.market_evidence(exchange, str(rationale.get("asset")), timeframe, at)
         for index, item in enumerate(rationale.get("supporting_evidence", [])):
             registry.add(f"support:{index}", "SYSTEM_METRIC", item)
         for index, item in enumerate(rationale.get("contradicting_evidence", [])):
@@ -242,22 +260,64 @@ class AIResearchService:
         events = self.session.scalars(select(MarketEvent).where(MarketEvent.id.in_(rationale.get("news_context") or []))).all()
         self._event_evidence(registry, list(events))
         registry.add("proposal", "SYSTEM_METRIC", {key: rationale.get(key) for key in (
-            "asset", "direction", "thesis", "timeframe_roles", "market_regime", "invalidation", "time_horizon", "evidence_strength")})
+            "asset", "direction", "thesis", "timeframe_roles", "market_regime", "invalidation", "time_horizon",
+            "evidence_strength", "strategy", "scanner_evidence", "strategy_risk")})
+        registry.add("risk_constraints", "SYSTEM_METRIC", {
+            "max_risk_per_trade": self.settings.max_risk_per_trade, "min_reward_risk": self.settings.min_reward_risk,
+            "long_only_spot": True, "note": "the deterministic risk engine sets final size, stop and target"})
         outcome = await self._run(
-            "TRADE_REVIEW", "decision_proposal", f"{rationale.get('asset')}:{rationale.get('decision_time')}", registry,
-            "Review this LONG trade proposal as a disciplined, risk-first trader. Identify evidence that supports it, evidence "
-            "that contradicts it, and anything that would invalidate it. Return exactly one proposal object: "
-            '{"verdict": "SUPPORT" | "REJECT" | "UNCERTAIN", "reasons": [string], "missing_information": [string]}. '
-            "Choose REJECT if contradicting evidence is material. Do not propose prices or sizes.")
+            "TRADE_DECISION", "decision_proposal", f"{rationale.get('asset')}:{rationale.get('decision_time')}", registry,
+            "Decide whether QTR should take this LONG spot paper trade, as a disciplined, risk-first trader. Use only "
+            "the evidence. Return exactly one proposal object: {\"decision\": \"TRADE\" | \"NO_TRADE\", "
+            "\"direction\": \"LONG\", \"entry\": number, \"stop_loss\": number, \"take_profit\": number, "
+            "\"thesis\": string, \"invalidation\": string, \"confidence\": number between 0 and 1, "
+            "\"evidence\": [evidence refs], \"reasons\": [string], \"missing_information\": [string]}. "
+            "Choose NO_TRADE when contradicting evidence is material or information is missing. Levels must satisfy "
+            "stop_loss < entry < take_profit.")
         if outcome.get("status") not in {"OK", "CACHED"}:
-            return {"status": "UNAVAILABLE", "error": outcome.get("error"), "verdict": None,
-                    "fallback": "deterministic evidence rules only (AI review not performed)"}
+            return {"status": outcome.get("status", "UNAVAILABLE"), "error": outcome.get("error"), "decision": None,
+                    "verdict": None, "fallback": "NO_TRADE unless the configured mode allows deterministic-only decisions"}
         artifact = self.session.get(AIArtifact, outcome["artifact_id"])
         proposal = next((item for item in (artifact.proposals if artifact else []) if isinstance(item, dict)), {})
-        verdict = str(proposal.get("verdict", "UNCERTAIN")).upper()
-        if verdict not in {"SUPPORT", "REJECT", "UNCERTAIN"}:
-            verdict = "UNCERTAIN"
-        return {"status": outcome["status"], "artifact_id": outcome["artifact_id"], "verdict": verdict,
-                "reasons": [str(reason)[:300] for reason in proposal.get("reasons", [])][:8],
-                "missing_information": [str(item)[:200] for item in proposal.get("missing_information", [])][:8],
+        return {"status": outcome["status"], "artifact_id": outcome["artifact_id"], **parse_trade_decision(proposal),
                 "verification": artifact.verification if artifact else {}}
+
+
+def _number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number and number not in (float("inf"), float("-inf")) else None
+
+
+def parse_trade_decision(proposal: dict[str, Any]) -> dict[str, Any]:
+    """Validate the AI decision object. Anything malformed becomes NO_TRADE with a reason."""
+    problems: list[str] = []
+    decision = str(proposal.get("decision", "")).upper()
+    if decision not in {"TRADE", "NO_TRADE"}:
+        problems.append("decision must be TRADE or NO_TRADE")
+        decision = "NO_TRADE"
+    direction = str(proposal.get("direction", "LONG")).upper()
+    entry, stop, target = (_number(proposal.get(key)) for key in ("entry", "stop_loss", "take_profit"))
+    confidence = _number(proposal.get("confidence"))
+    if decision == "TRADE":
+        if direction != "LONG":
+            problems.append("only LONG spot trades are supported")
+        if entry is None or stop is None or target is None or not (0 < stop < entry < target):
+            problems.append("levels must satisfy 0 < stop_loss < entry < take_profit")
+        if confidence is None or not 0 <= confidence <= 1:
+            problems.append("confidence must be between 0 and 1")
+    final = "TRADE" if decision == "TRADE" and not problems else "NO_TRADE"
+    return {
+        "decision": final, "ai_decision": decision, "direction": direction, "entry": entry, "stop_loss": stop,
+        "take_profit": target, "confidence": confidence,
+        "thesis": str(proposal.get("thesis", ""))[:800], "invalidation": str(proposal.get("invalidation", ""))[:500],
+        "evidence": [str(item)[:120] for item in proposal.get("evidence", []) if item][:12]
+        if isinstance(proposal.get("evidence"), list) else [],
+        "reasons": [str(reason)[:300] for reason in proposal.get("reasons", [])][:8] if isinstance(proposal.get("reasons"), list) else [],
+        "missing_information": [str(item)[:200] for item in proposal.get("missing_information", [])][:8]
+        if isinstance(proposal.get("missing_information"), list) else [],
+        "validation_problems": problems,
+        "verdict": "SUPPORT" if final == "TRADE" else ("REJECT" if decision == "NO_TRADE" and not problems else "UNCERTAIN"),
+    }

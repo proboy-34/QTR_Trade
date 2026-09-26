@@ -1,6 +1,7 @@
 import hashlib
 
 import pytest
+from paper_fixtures import LEGACY, add_passes, validated_version
 from sqlalchemy import func, select
 
 from app.core.config import Settings
@@ -31,7 +32,7 @@ def intent(session, price: float = 100) -> TradeIntent:
     session.add(decision)
     session.flush()
     item = TradeIntent(
-        decision_id=decision.id, strategy_version_id="version", symbol="BTCUSDT", side="BUY",
+        decision_id=decision.id, strategy_version_id=validated_version(session).id, symbol="BTCUSDT", side="BUY",
         entry_price=price, stop_loss=None, take_profit=None, confidence=1,
     )
     session.add(item)
@@ -96,14 +97,17 @@ async def test_valid_opportunity_rejected_by_risk_creates_no_order_or_position(s
     strategy = Strategy(name="Risk rejection", symbol="BTCUSDT", timeframe="1h", status="active")
     session.add(strategy)
     session.flush()
-    session.add(StrategyVersion(
+    version = StrategyVersion(
         strategy_id=strategy.id, version=1, parameters={}, entry_rules=[{"rule": "bullish"}],
         exit_rules=[{"rule": "reverse"}], filters={"regime": ["trending"]},
         risk_assumptions={}, documentation="risk rejection test strategy",
         content_hash=hashlib.sha256(b"risk").hexdigest(),
-    ))
+    )
+    session.add(version)
+    session.flush()
+    add_passes(session, version.id)
     portfolio(session, exposure=0.5)
-    result = await TradingPipeline(session, Settings(), EventBus()).evaluate(
+    result = await TradingPipeline(session, Settings(**LEGACY), EventBus()).evaluate(
         MarketSnapshot("BTCUSDT", 65_000, 2_000, .4, 0, "trending", "BULLISH")
     )
     assert result["outcome"] == "TRADE" and result["risk_outcome"] == "REJECTED"

@@ -120,7 +120,8 @@ class BinanceTestnetExchange:
         started = perf_counter()
         order = Order(execution_plan_id=plan.id, exchange=self.venue, client_order_id=coid, exchange_order_id="pending",
                       symbol=plan.symbol, side=plan.side, order_type="MARKET", quantity=plan.quantity,
-                      fill_quantity=ZERO, fees=ZERO, status="SUBMITTED", raw_response={"venue": "binance-spot-testnet"})
+                      fill_quantity=ZERO, fees=ZERO, status="SUBMITTED", raw_response={"venue": "binance-spot-testnet"},
+                      execution_mode="TESTNET", market_data_source="BINANCE_SPOT_TESTNET", reference_price=price(market_price))
         self.session.add(order)
         self.session.flush()
         try:

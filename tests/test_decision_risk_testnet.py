@@ -8,6 +8,7 @@ from urllib.parse import parse_qs
 
 import httpx
 import pytest
+from paper_fixtures import validated_version
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 
@@ -129,7 +130,8 @@ def make_intent(session, symbol="BTCUSDT") -> TradeIntent:
                         reasoning=["t"], correlation_id="c")
     session.add(decision)
     session.flush()
-    intent = TradeIntent(decision_id=decision.id, strategy_version_id="v", symbol=symbol, side="BUY", entry_price=100, confidence=1)
+    intent = TradeIntent(decision_id=decision.id, strategy_version_id=validated_version(session, symbol).id, symbol=symbol,
+                         side="BUY", entry_price=100, confidence=1)
     session.add(intent)
     session.flush()
     return intent
@@ -257,3 +259,43 @@ async def test_testnet_rejection_opens_nothing_and_hides_credentials(session):
                                order_type="MARKET", status="approved", risk_amount=1, stop_loss=95, take_profit=110, leverage=1)
     with pytest.raises(SafetyError):
         await exchange.submit(paper_plan, intent, 100, "corr")  # never executes another venue's plan
+
+
+def test_risk_quote_gates_and_lookahead_guard(session):
+    from decimal import Decimal
+
+    from app.global_services.quotes import Quote
+
+    eligible(session, "BTCUSDT")
+    session.commit()
+    engine = RiskEngine(session, Settings())
+    fresh = Quote("BTCUSDT", Decimal("100.00"), Decimal("100.01"), datetime.now(UTC))
+
+    def with_quote(quote, **extra):
+        return MarketFacts("binance", "1h", NOW, NOW - timedelta(hours=1), quote=quote, require_quote=True, **extra)
+
+    assert engine.assess(make_intent(session), 100, 0.2, with_quote(fresh)).approved
+    stale = Quote("BTCUSDT", Decimal("100.00"), Decimal("100.01"), datetime.now(UTC) - timedelta(minutes=5))
+    assert "STALE_QUOTE" in engine.assess(make_intent(session), 100, 0.2, with_quote(stale)).reason_codes
+    wide = Quote("BTCUSDT", Decimal("99"), Decimal("101"), datetime.now(UTC))
+    assert "SPREAD_TOO_WIDE" in engine.assess(make_intent(session), 100, 0.2, with_quote(wide)).reason_codes
+    assert "QUOTE_UNAVAILABLE" in engine.assess(make_intent(session), 100, 0.2, with_quote(None)).reason_codes
+    failed = with_quote(fresh, provider_errors=["candle sync: HTTP 451"])
+    assert "PROVIDER_FAILURE:candle sync: HTTP 451" in engine.assess(make_intent(session), 100, 0.2, failed).reason_codes
+    future = MarketFacts("binance", "1h", NOW, NOW + timedelta(hours=1), quote=fresh, require_quote=True)
+    assert "LOOKAHEAD_VIOLATION" in engine.assess(make_intent(session), 100, 0.2, future).reason_codes
+
+
+def test_rejected_or_unvalidated_strategy_cannot_trade(session):
+    from app.models import ValidationResult
+
+    eligible(session, "BTCUSDT")
+    intent = make_intent(session)
+    version = session.get(StrategyVersion, intent.strategy_version_id)
+    version.strategy.status = "retired"
+    session.commit()
+    assert "STRATEGY_NOT_PAPER_ELIGIBLE" in RiskEngine(session, Settings()).assess(intent, 100, 0.2, facts()).reason_codes
+    other = make_intent(session)
+    session.add(ValidationResult(strategy_version_id=other.strategy_version_id, method="robustness", result="FAIL", metrics={}))
+    session.commit()
+    assert "STRATEGY_NOT_PAPER_ELIGIBLE" in RiskEngine(session, Settings()).assess(other, 100, 0.2, facts()).reason_codes

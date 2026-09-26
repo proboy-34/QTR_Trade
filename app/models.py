@@ -15,6 +15,7 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -188,6 +189,8 @@ class Strategy(Base, TimestampMixin):
     hypothesis_id: Mapped[str | None] = mapped_column(String(36), index=True)
     health_status: Mapped[str] = mapped_column(String(30), default="INSUFFICIENT_DATA", index=True)
     health_details: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    validation_summary: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    validated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     versions: Mapped[list["StrategyVersion"]] = relationship(back_populates="strategy")
 
 
@@ -342,6 +345,15 @@ class Position(Base, TimestampMixin):
     venue: Mapped[str] = mapped_column(String(20), default="paper", index=True)
     opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=TimeService.now)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # REST monitoring: the last closed candle already applied to this position (restart-safe).
+    timeframe: Mapped[str | None] = mapped_column(String(10))
+    market_exchange: Mapped[str | None] = mapped_column(String(30))
+    last_evaluated_candle_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    bars_held: Mapped[int] = mapped_column(Integer, default=0)
+    max_holding_bars: Mapped[int | None] = mapped_column(Integer)
+    decision_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    slippage_cost: Mapped[Decimal] = mapped_column(MONEY, default=Decimal("0"))
+    exit_price: Mapped[Decimal | None] = mapped_column(PRICE)
 
 
 class Order(Base, TimestampMixin):
@@ -361,6 +373,14 @@ class Order(Base, TimestampMixin):
     fees: Mapped[Decimal] = mapped_column(MONEY, default=Decimal("0"))
     status: Mapped[str] = mapped_column(String(30), index=True)
     raw_response: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    # Provenance: paper fills are SIMULATED against real quotes; they are never exchange fills.
+    execution_mode: Mapped[str] = mapped_column(String(20), default="PAPER", index=True)
+    market_data_source: Mapped[str] = mapped_column(String(30), default="UNKNOWN")
+    reference_price: Mapped[Decimal | None] = mapped_column(PRICE)
+    bid: Mapped[Decimal | None] = mapped_column(PRICE)
+    ask: Mapped[Decimal | None] = mapped_column(PRICE)
+    quote_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    slippage_cost: Mapped[Decimal] = mapped_column(MONEY, default=Decimal("0"))
 
 
 class Fill(Base):
@@ -847,3 +867,22 @@ class MacroObservation(Base):
     __table_args__ = (
         Index("ix_macro_vintage_unique", "source", "series_id", "observation_date", "realtime_start", unique=True),
     )
+
+
+class ProcessedCandle(Base):
+    """Idempotency ledger of the REST closed-candle loop: one row per exchange/symbol/timeframe/open time."""
+
+    __tablename__ = "processed_candles"
+    __table_args__ = (UniqueConstraint("exchange", "symbol", "timeframe", "candle_open_time",
+                                       name="uq_processed_candle"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    exchange: Mapped[str] = mapped_column(String(30))
+    symbol: Mapped[str] = mapped_column(String(30), index=True)
+    timeframe: Mapped[str] = mapped_column(String(10))
+    candle_open_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    candle_close_time: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(20), default="CLAIMED", index=True)
+    outcome: Mapped[str | None] = mapped_column(String(20))
+    decision_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    detail: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    processed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=TimeService.now, index=True)

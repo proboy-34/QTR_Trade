@@ -372,7 +372,21 @@ class HypothesisEngine:
             "deflated_sharpe": round(dsr, 4), "trials": results[0]["data_snooping"]["trials"] if results else 0,
             "parameter_count": spec.parameter_count, "per_asset": results,
         }
+        traded_regimes: dict[str, int] = {}
+        weakest: float | None = None
+        for item in results:
+            for regime_name, stats in (item.get("regimes") or {}).items():
+                traded_regimes[regime_name] = traded_regimes.get(regime_name, 0) + int(stats.get("trades", 0))
+                factor = stats.get("profit_factor")
+                if stats.get("trades", 0) >= 5 and factor is not None:
+                    weakest = factor if weakest is None else min(weakest, factor)
+        required_regimes = 1 if spec.regimes else self.gates.min_regimes_traded
+        summary["regime_coverage"] = {"trades_by_regime": traded_regimes, "regimes_traded": len(traded_regimes),
+                                      "weakest_sufficient_regime_profit_factor": weakest,
+                                      "declared_regimes": list(spec.regimes)}
         checks = {
+            "regimes_traded": _check(len(traded_regimes), required_regimes),
+            "weakest_regime_profit_factor": _check(weakest if weakest is not None else 999.0, self.gates.min_regime_profit_factor),
             "perturbation_stability": _check(stability, self.gates.min_perturbation_stability),
             "cost_stress": _check(stressed, self.gates.min_stressed_return_pct + 1e-9),
             "monte_carlo_drawdown": _check(mc_drawdown, self.gates.min_mc_p5_drawdown_pct),
@@ -454,6 +468,8 @@ class HypothesisEngine:
                 rules={"rule": comparison.get("rule")}, configuration={"hypothesis_id": hypothesis.id},
                 notes="Challenger evaluated against the unchanged champion",
             ))
+        strategy.validation_summary = self._validation_summary(hypothesis, scopes)
+        strategy.validated_at = TimeService.now()
         self.session.flush()
         repository.transition(strategy.id, "under_validation", "automated research gates", actor="research")
         repository.transition(strategy.id, "paper_testing", "all research gates passed", actor="research")
@@ -471,6 +487,33 @@ class HypothesisEngine:
         await publish_persisted(self.session, self.event_bus, Event("RESEARCH_CANDIDATE_CREATED", {
             "hypothesis_id": hypothesis.id, "strategy_id": strategy.id, "strategy_version_id": version.id,
         }, source="hypothesis_engine"), "research")
+
+    def _validation_summary(self, hypothesis: Hypothesis, scopes: list[dict[str, Any]]) -> dict[str, Any]:
+        """Explicit, persisted record of what was validated, on which data and with which costs."""
+        periods = []
+        for scope in scopes:
+            frame = self._frame(scope)
+            cut = int(len(frame) * self.gates.is_fraction)
+            stamps = [pd.Timestamp(value).isoformat() for value in frame["timestamp"]]
+            periods.append({
+                "exchange": scope["exchange"], "symbol": scope["symbol"], "timeframe": scope["timeframe"], "bars": len(frame),
+                "dataset_period": [stamps[0], stamps[-1]] if stamps else None,
+                "training_period": [stamps[0], stamps[cut - 1]] if cut > 0 else None,
+                "validation_period": [stamps[cut], stamps[-1]] if cut < len(stamps) else None,
+                "walk_forward_windows": ((hypothesis.evidence or {}).get("walk_forward") or {}).get("summary", {}).get("windows"),
+                "dataset_fingerprint": scope["fingerprint"],
+            })
+        evidence = hypothesis.evidence or {}
+        return {
+            "validation_status": "PASS", "validated_at": TimeService.now().isoformat(), "hypothesis_id": hypothesis.id,
+            "periods": periods, "costs": {"fee_rate": self.costs.fee_rate, "slippage_rate": self.costs.slippage_rate,
+                                          "spread_bps": self.costs.spread_bps},
+            "metrics": {key: (evidence.get(key) or {}).get("summary") for key in ("backtest", "out_of_sample", "walk_forward")},
+            "robustness": {key: value for key, value in ((evidence.get("robustness") or {}).get("summary") or {}).items() if key != "per_asset"},
+            "regime_coverage": ((evidence.get("robustness") or {}).get("summary") or {}).get("regime_coverage"),
+            "gates": gates_dict(self.gates), "experiments": len(evidence.get("experiment_ids", [])),
+            "rejection_reasons": [], "execution": "next-bar open, costs on both legs",
+        }
 
     async def _paper_validation(self, hypothesis: Hypothesis) -> None:
         from app.learning.paper_validation import PaperValidationService

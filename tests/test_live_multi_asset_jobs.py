@@ -81,8 +81,11 @@ async def test_job_runner_persists_outcomes_and_respects_system_stop(session):
     assert records["ok_job"].status == "COMPLETED" and isinstance(records["ok_job"].details["when"], str)
     assert records["broken_job"].status == "FAILED" and "provider down" in records["broken_job"].error
     registered = jobs(context)
-    assert {"market_scan", "research_queue", "learning", "safety_monitor", "news_ingestion", "universe_refresh",
+    assert {"closed_candle_cycle", "research_queue", "learning", "safety_monitor", "news_ingestion", "universe_refresh",
             "macro_ingestion", "provider_verification"} <= set(registered)
+    # The REST cycle syncs and scans itself; standalone sync/scan jobs would duplicate that work.
+    assert "market_scan" not in registered and "market_data_sync" not in registered
+    registered = {**registered, **jobs(JobContext(factory, Settings(candle_cycle_enabled=False), EventBus()))}
     assert "testnet_reconciliation" not in registered  # only scheduled in testnet mode
     news = await run_job(context, "news_ingestion", registered["news_ingestion"][1])
     assert news["skipped"] == "FINNHUB_API_KEY not configured"
@@ -91,5 +94,6 @@ async def test_job_runner_persists_outcomes_and_respects_system_stop(session):
     assert (await run_job(context, "market_scan", registered["market_scan"][1]))["skipped"] == "SYSTEM_STOP"
     assert (await run_job(context, "research_queue", registered["research_queue"][1]))["skipped"] == "SYSTEM_STOP"
     assert session.scalar(select(func.count()).select_from(SafetyControl)) == 1
-    disabled = jobs(JobContext(factory, Settings(market_scanner_enabled=False, market_sync_enabled=False), EventBus()))
+    disabled = jobs(JobContext(factory, Settings(market_scanner_enabled=False, market_sync_enabled=False,
+                                                 candle_cycle_enabled=False), EventBus()))
     assert "market_scan" not in disabled and "market_data_sync" not in disabled

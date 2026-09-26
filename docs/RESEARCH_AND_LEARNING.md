@@ -117,3 +117,10 @@ deterministic rules decide alone — no substitute text is generated.
   available from D+1 00:00 UTC (release times are not provided by FRED), and revisions are only
   visible from their own vintage date. `macro_as_of(t)` therefore never returns a later revision.
 - Regimes: the reasoner only reads regime records whose candle closed before the decision.
+
+## Research data, regime testing and eligibility
+
+- Research uses the closed Binance candles synced by the REST loop (`RESEARCH_HISTORY_CANDLES`, default 2000 per asset; about 83 days of 1h candles).
+- The robustness gate includes regime testing: trades must span at least 2 regimes (1 for regime-restricted specifications), and no regime with 5 or more trades may have a profit factor below 0.6.
+- When the research backlog is empty, a baseline programme tests the reviewed templates (EMA trend change, volume-confirmed breakout, volatility expansion) on the most liquid eligible assets. These are ordinary hypotheses and most are expected to fail.
+- A promoted candidate stores an explicit `validation_summary`: dataset, training and validation periods, walk-forward windows, costs, metrics, robustness, regime coverage and gate thresholds, plus `validated_at`. `/api/v1/strategies/lifecycle` shows candidate, validated, paper-eligible, active, disabled and rejected items, with reasons.

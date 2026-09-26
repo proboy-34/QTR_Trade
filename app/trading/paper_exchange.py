@@ -7,29 +7,52 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
-from app.core.decimal_math import ONE, ZERO, decimal, money, price, quantity, rate
+from app.core.decimal_math import ONE, ZERO, decimal, money, price, quantity
 from app.core.errors import SafetyError
 from app.core.events import Event, EventBus, publish_persisted
 from app.global_services.assets import AssetRegistryService
+from app.global_services.quotes import Quote
 from app.models import (
     ExecutionPlan,
     ExecutionReport,
     Fill,
     Order,
-    PortfolioSnapshot,
     Position,
     PositionEvent,
     TradeIntent,
 )
 from app.trading.accounts import latest_portfolio
+from app.trading.paper_account import PaperAccount
 from app.trading.safety import SafetyService
 
 
 class PaperExchange:
-    """Deterministic paper venue with configurable fills and idempotent client IDs."""
+    """Paper venue: SIMULATED execution against real market quotes, idempotent client IDs.
 
-    def __init__(self, session: Session, settings: Settings, event_bus: EventBus) -> None:
+    With a real quote a BUY pays the real ask and a SELL receives the real bid, plus the
+    configured slippage. Without a quote (deterministic fixtures, demo) the reference price
+    gets slippage plus half the configured spread, and the order is labelled accordingly.
+    Orders always carry execution_mode="PAPER": they are never presented as exchange fills.
+    """
+
+    def __init__(self, session: Session, settings: Settings, event_bus: EventBus,
+                 quote: Quote | None = None, instrument_exchange: str | None = None) -> None:
         self.session, self.settings, self.event_bus = session, settings, event_bus
+        self.quote = quote
+        self.instrument_exchange = instrument_exchange
+
+    def _instrument(self, symbol: str):
+        registry = AssetRegistryService(self.session)
+        if self.instrument_exchange:
+            found = registry.instrument(self.instrument_exchange, symbol)
+            if found:
+                return found
+        return registry.instrument("paper", symbol)
+
+    def _source(self) -> str:
+        if self.quote is not None:
+            return self.quote.source
+        return "DEMO_SYNTHETIC" if self.settings.demo_mode else "REFERENCE_PRICE"
 
     async def submit(
         self, plan: ExecutionPlan, intent: TradeIntent, market_price: float, correlation_id: str
@@ -51,12 +74,13 @@ class PaperExchange:
         if plan.order_type == "MARKET":
             # A market order has no price of its own; it fills on the venue's tick grid, so the
             # observed reference price is aligned to that grid before instrument validation.
-            reference = AssetRegistryService(self.session).instrument("paper", plan.symbol)
+            reference = self._instrument(plan.symbol)
             if reference and decimal(reference.tick_size) > ZERO:
                 tick = decimal(reference.tick_size)
                 validation_price = (validation_price / tick).to_integral_value() * tick
+        instrument = self._instrument(plan.symbol)
         validation = AssetRegistryService(self.session).validate_order(
-            "paper", plan.symbol, decimal(plan.quantity), validation_price
+            instrument.exchange if instrument else "paper", plan.symbol, decimal(plan.quantity), validation_price
         )
         validation_errors = list(validation.errors)
         latest = latest_portfolio(self.session, "paper")
@@ -77,6 +101,7 @@ class PaperExchange:
                 exchange_order_id=f"paper-{uuid4().hex[:12]}", symbol=plan.symbol, side=plan.side,
                 order_type=plan.order_type, quantity=plan.quantity, fill_quantity=ZERO,
                 fees=ZERO, status="REJECTED", raw_response={"errors": validation_errors},
+                **self._provenance(market_price),
             )
             self.session.add(order)
             self.session.flush()
@@ -94,7 +119,8 @@ class PaperExchange:
             fill_quantity=ZERO,
             fees=ZERO,
             status="SUBMITTED",
-            raw_response={"simulated": True},
+            raw_response={"simulated": True, "note": "paper order: simulated fill, not an exchange fill"},
+            **self._provenance(market_price),
         )
         self.session.add(order)
         self.session.flush()
@@ -109,6 +135,22 @@ class PaperExchange:
             self._report(order, started)
             return {"order_id": order.id, "position_id": None, "idempotent": False}
         return await self._fill(order, plan, intent, market_price, correlation_id, started)
+
+    def _provenance(self, market_price: float) -> dict:
+        return {"execution_mode": "PAPER", "market_data_source": self._source(),
+                "reference_price": price(market_price),
+                "bid": self.quote.bid if self.quote else None, "ask": self.quote.ask if self.quote else None,
+                "quote_at": self.quote.observed_at if self.quote else None}
+
+    def fill_price(self, side: str, market_price: float) -> tuple:
+        """(fill price, touch price) for a market order on this venue."""
+        slip = decimal(self.settings.paper_slippage_rate)
+        if self.quote is not None:
+            touch = self.quote.ask if side == "BUY" else self.quote.bid
+            return price(touch * (ONE + slip if side == "BUY" else ONE - slip)), touch
+        adverse = slip + decimal(self.settings.paper_spread_bps) / 20_000
+        reference = decimal(market_price)
+        return price(reference * (ONE + adverse if side == "BUY" else ONE - adverse)), reference
 
     def _should_fill(self, plan: ExecutionPlan, market_price: float) -> bool:
         market = decimal(market_price)
@@ -155,10 +197,8 @@ class PaperExchange:
         fill_quantity = quantity(remaining * ratio)
         if fill_quantity <= ZERO:
             return {"order_id": order.id, "position_id": order.position_id, "idempotent": True}
-        adverse = decimal(self.settings.paper_slippage_rate) + decimal(self.settings.paper_spread_bps) / 20_000
-        slippage = adverse * (ONE if plan.side == "BUY" else -ONE)
-        fill_price = price(decimal(market_price) * (ONE + slippage))
-        instrument = AssetRegistryService(self.session).instrument("paper", plan.symbol)
+        fill_price, touch = self.fill_price(plan.side, market_price)
+        instrument = self._instrument(plan.symbol)
         if instrument and decimal(instrument.tick_size) > ZERO:
             # Fills land on the venue's tick grid, rounded against the trader.
             tick = decimal(instrument.tick_size)
@@ -166,6 +206,7 @@ class PaperExchange:
             steps = steps.to_integral_value(rounding=ROUND_CEILING if plan.side == "BUY" else ROUND_FLOOR)
             fill_price = price(steps * tick)
         fee = money(fill_quantity * fill_price * decimal(self.settings.paper_fee_rate))
+        order.slippage_cost = money(decimal(order.slippage_cost or ZERO) + abs(fill_price - touch) * fill_quantity)
         previous_fill = decimal(order.fill_quantity)
         total_fill = quantity(previous_fill + fill_quantity)
         order.average_fill_price = price((
@@ -198,6 +239,7 @@ class PaperExchange:
                 quantity=fill_quantity, entry_price=fill_price, current_price=fill_price,
                 highest_price=fill_price, lowest_price=fill_price,
                 stop_loss=plan.stop_loss, take_profit=plan.take_profit, status="OPEN", fees=fee, venue="paper",
+                decision_id=intent.decision_id, slippage_cost=money(abs(fill_price - touch) * fill_quantity),
             )
             self.session.add(position)
             self.session.flush()
@@ -207,19 +249,8 @@ class PaperExchange:
             from_status="OPENING" if opened else "OPEN", to_status="OPEN",
             price=fill_price, quantity=fill_quantity, reason="paper fill",
         ))
-        latest = latest_portfolio(self.session, "paper")
-        equity = decimal(latest.equity) if latest else decimal(self.settings.starting_equity)
-        available = decimal(latest.available_balance) if latest else equity
-        notional = money(fill_quantity * fill_price)
-        self.session.add(PortfolioSnapshot(
-            venue="paper",
-            equity=money(equity - fee),
-            available_balance=money(available - notional / decimal(plan.leverage) - fee),
-            exposure=rate((decimal(latest.exposure) if latest else ZERO) + notional / max(equity, ONE)),
-            margin_used=money((decimal(latest.margin_used) if latest else ZERO) + notional / decimal(plan.leverage)),
-            daily_pnl=money((decimal(latest.daily_pnl) if latest else ZERO) - fee),
-            drawdown=rate(max(decimal(latest.drawdown) if latest else ZERO, fee / max(equity, ONE))),
-        ))
+        self.session.flush()
+        PaperAccount(self.session, self.settings).snapshot()
         self._report(order, started)
         event_type = "OrderFilled" if order.status == "FILLED" else "OrderPartiallyFilled"
         await publish_persisted(

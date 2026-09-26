@@ -26,7 +26,9 @@ from app.models import JobExecution, MarketCandle, ProviderCheck
 HEALTHY, DEGRADED, UNAVAILABLE, STALE, NOT_CONFIGURED, NOT_VERIFIED = (
     "HEALTHY", "DEGRADED", "UNAVAILABLE", "STALE", "NOT_CONFIGURED", "NOT_VERIFIED",
 )
-PROVIDERS = ("binance", "gemini", "finnhub", "fred")
+# Binance public market data and Binance authenticated account access are separate
+# components: public data needs no credentials; the account needs a key AND secret.
+PROVIDERS = ("binance", "binance_account", "gemini", "finnhub", "fred")
 
 
 @dataclass
@@ -125,17 +127,20 @@ class ProviderVerifier:
             await self._get("book_ticker", base, "/api/v3/ticker/bookTicker", params={"symbol": "BTCUSDT"}, validate=book),
             await self._get("klines", base, "/api/v3/klines", params={"symbol": "BTCUSDT", "interval": "1m", "limit": 3}, validate=klines),
         ]
-        if not self.settings.binance_api_key:
-            checks.append(CheckOutcome("api_key", "/api/v3/account", "NOT_CONFIGURED", False,
-                                       detail="BINANCE_API_KEY not set; public data needs no key"))
-        elif not self.settings.binance_api_secret:
-            checks.append(CheckOutcome("api_key", "/api/v3/account", "SKIPPED", False,
-                                       detail="BINANCE_API_SECRET not set: the key cannot be verified without a signed request"))
-        else:
-            from app.integrations.binance_account import verify_account
-
-            checks.extend(await verify_account(self.settings, self.transport, self.timeout))
         return checks
+
+    async def binance_account(self) -> list[CheckOutcome]:
+        """Authenticated, read-only account verification. Never places orders; not needed for paper trading."""
+        if not self.settings.binance_api_key:
+            return [CheckOutcome("api_key", "/api/v3/account", "NOT_CONFIGURED",
+                                 detail="BINANCE_API_KEY not set (public market data needs no key)")]
+        if not self.settings.binance_api_secret:
+            return [CheckOutcome("api_key", "/api/v3/account", "NOT_CONFIGURED",
+                                 detail="BINANCE_API_SECRET not configured: authenticated account access unavailable "
+                                        "(public market data and paper trading are unaffected)")]
+        from app.integrations.binance_account import verify_account
+
+        return await verify_account(self.settings, self.transport, self.timeout)
 
     async def gemini(self, generate: bool = True) -> list[CheckOutcome]:
         if not self.settings.gemini_api_key:
@@ -218,7 +223,8 @@ class ProviderVerifier:
     async def run(self, session: Session, providers: tuple[str, ...] = PROVIDERS, generate: bool = True) -> dict[str, Any]:
         run_id = str(uuid4())
         runners: dict[str, Callable[[], Awaitable[list[CheckOutcome]]]] = {
-            "binance": self.binance, "gemini": lambda: self.gemini(generate), "finnhub": self.finnhub, "fred": self.fred,
+            "binance": self.binance, "binance_account": self.binance_account,
+            "gemini": lambda: self.gemini(generate), "finnhub": self.finnhub, "fred": self.fred,
         }
         results: dict[str, Any] = {}
         for provider in providers:
@@ -252,6 +258,10 @@ def latest_checks(session: Session, provider: str) -> list[ProviderCheck]:
 
 
 def provider_health(session: Session, settings: Settings, provider: str) -> dict[str, Any]:
+    if provider == "binance_account" and not (settings.binance_api_key and settings.binance_api_secret):
+        return {"state": NOT_CONFIGURED, "checked_at": None, "checks": [],
+                "note": "Authenticated account access not configured (BINANCE_API_SECRET unavailable). "
+                        "Public market data and paper trading do not need it."}
     checks = latest_checks(session, provider)
     if not checks:
         return {"state": NOT_VERIFIED, "checked_at": None, "checks": [], "note": "No verification has run yet"}

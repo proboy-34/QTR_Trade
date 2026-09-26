@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from market_fixtures import oscillating, random_walk, store
+from paper_fixtures import LEGACY, add_passes, validated_version
 from sqlalchemy import func, select
 
 from app.core.config import Settings
@@ -50,11 +51,12 @@ def portfolio(session, **values) -> None:
     session.commit()
 
 
-def intent(session, symbol: str = "BTCUSDT", strategy_version_id: str = "version") -> TradeIntent:
+def intent(session, symbol: str = "BTCUSDT", strategy_version_id: str | None = None) -> TradeIntent:
     decision = Decision(symbol=symbol, outcome="TRADE", market_context={}, evaluations=[], confidence=1, reasoning=["t"], correlation_id="c")
     session.add(decision)
     session.flush()
-    item = TradeIntent(decision_id=decision.id, strategy_version_id=strategy_version_id, symbol=symbol, side="BUY",
+    item = TradeIntent(decision_id=decision.id, strategy_version_id=strategy_version_id or validated_version(session, symbol).id,
+                       symbol=symbol, side="BUY",
                        entry_price=100, confidence=1)
     session.add(item)
     session.flush()
@@ -140,16 +142,19 @@ async def test_system_stop_ignores_evaluation_and_strategy_stop_blocks_only_that
     strategy = Strategy(name="Blocked", symbol="BTCUSDT", timeframe="1h", status="active")
     session.add(strategy)
     session.flush()
-    session.add(StrategyVersion(strategy_id=strategy.id, version=1, parameters={}, entry_rules=[{"rule": "x"}], exit_rules=[],
-                                filters={}, risk_assumptions={}, documentation="d", content_hash=hashlib.sha256(b"b").hexdigest()))
+    version = StrategyVersion(strategy_id=strategy.id, version=1, parameters={}, entry_rules=[{"rule": "x"}], exit_rules=[],
+                              filters={}, risk_assumptions={}, documentation="d", content_hash=hashlib.sha256(b"b").hexdigest())
+    session.add(version)
+    session.flush()
+    add_passes(session, version.id)
     session.commit()
     SafetyService(session).activate("STRATEGY", "review", target=strategy.id)
     session.commit()
-    result = await TradingPipeline(session, Settings(), EventBus()).evaluate(MarketSnapshot("BTCUSDT", 100, 10, .2, 0, "trending", "BULLISH"))
+    result = await TradingPipeline(session, Settings(**LEGACY), EventBus()).evaluate(MarketSnapshot("BTCUSDT", 100, 10, .2, 0, "trending", "BULLISH"))
     assert result["risk_outcome"] == "REJECTED" and "SAFETY_STRATEGY_STOP" in result["risk_reasons"]
     SafetyService(session).activate("SYSTEM", "maintenance")
     session.commit()
-    halted = await TradingPipeline(session, Settings(), EventBus()).evaluate(MarketSnapshot("BTCUSDT", 100, 10, .2, 0, "trending", "BULLISH"))
+    halted = await TradingPipeline(session, Settings(**LEGACY), EventBus()).evaluate(MarketSnapshot("BTCUSDT", 100, 10, .2, 0, "trending", "BULLISH"))
     assert halted["outcome"] == "IGNORE" and "SAFETY_SYSTEM_STOP" in halted["reasoning"][0]
 
 

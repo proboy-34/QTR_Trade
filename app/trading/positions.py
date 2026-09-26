@@ -24,6 +24,14 @@ class PositionManager:
     def _portfolio_after_close(
         self, position: Position, close_quantity, exit_price, realized, fee
     ) -> None:
+        if (position.venue or "paper") == "paper":
+            # The paper ledger is recomputed from positions (restart-safe, no drift).
+            from app.core.config import get_settings
+            from app.trading.paper_account import PaperAccount
+
+            self.session.flush()
+            PaperAccount(self.session, get_settings()).snapshot()
+            return
         latest = latest_portfolio(self.session, position.venue or "paper")
         if not latest:
             return
@@ -102,7 +110,8 @@ class PositionManager:
         self.session.commit()
         return position
 
-    def close(self, position: Position, price_value: float | Decimal, reason: str) -> Position:
+    def close(self, position: Position, price_value: float | Decimal, reason: str,
+              slippage_cost: Decimal | None = None) -> Position:
         if position.status not in {"OPEN", "MANAGING"}:
             raise ValueError("Position is not closable")
         previous = position.status
@@ -121,6 +130,9 @@ class PositionManager:
         position.fees = money(decimal(position.fees) + fee)
         position.unrealized_pnl = ZERO
         position.exit_reason = reason
+        position.exit_price = exit_price
+        if slippage_cost is not None:
+            position.slippage_cost = money(decimal(position.slippage_cost or ZERO) + slippage_cost)
         position.closed_at = TimeService.now()
         self.session.add(PositionEvent(
             position_id=position.id, event_type="CLOSED", from_status=previous, to_status="CLOSED",

@@ -4,6 +4,7 @@ from decimal import Decimal
 
 import pytest
 from market_fixtures import EMA_SPEC, oscillating, store
+from paper_fixtures import LEGACY
 from sqlalchemy import func, select
 
 from app.core.config import Settings
@@ -49,6 +50,10 @@ def strategy_with_version(session, status="active", oos_expectancy=1.0, name="Le
     session.add(ValidationResult(strategy_version_id=version.id, method="out_of_sample", result="PASS",
                                  metrics={"expectancy_pct": oos_expectancy, "profit_factor": 2.0, "win_rate": 60},
                                  configuration={"costs": {"slippage_rate": 0.0002, "spread_bps": 2}}))
+    for method in ("backtest", "walk_forward", "robustness"):  # remaining required evidence (fixture)
+        session.add(ValidationResult(strategy_version_id=version.id, method=method, result="PASS",
+                                     metrics={"expectancy_pct": oos_expectancy, "profit_factor": 2.0, "win_rate": 60},
+                                     configuration={"costs": {"slippage_rate": 0.0002, "spread_bps": 2}}))
     session.add(PortfolioSnapshot(equity=100_000, available_balance=100_000, exposure=0, margin_used=0, daily_pnl=0, drawdown=0))
     session.commit()
     return strategy, version
@@ -126,7 +131,7 @@ async def test_risk_rejected_signal_is_captured_as_counterfactual(session):
     strategy, _ = strategy_with_version(session)
     session.add(PortfolioSnapshot(equity=100_000, available_balance=100_000, exposure=0.5, margin_used=0, daily_pnl=0, drawdown=0))
     session.commit()
-    result = await TradingPipeline(session, Settings(), EventBus()).evaluate(
+    result = await TradingPipeline(session, Settings(**LEGACY), EventBus()).evaluate(
         MarketSnapshot("BTCUSDT", 65_000, 2_000, .4, 0, "trending", "BULLISH"))
     assert result["risk_outcome"] == "REJECTED"
     CounterfactualService(session).capture()
@@ -203,7 +208,7 @@ async def test_decision_memory_reconstructs_inputs_by_reference(session):
                         source="fixture", affected_assets=["BTC"], description="d", verification_status="SOURCE_VERIFIED")
     session.add(event)
     session.commit()
-    result = await TradingPipeline(session, Settings(), EventBus()).evaluate(
+    result = await TradingPipeline(session, Settings(**LEGACY), EventBus()).evaluate(
         MarketSnapshot("BTCUSDT", 65_000, 2_000, .3, 0, "trending", "BULLISH"))
     decision = session.get(Decision, result["decision_id"])
     lineage = decision.lineage

@@ -2,6 +2,7 @@
 import numpy as np
 import pandas as pd
 import pytest
+from paper_fixtures import LEGACY, add_passes
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 
@@ -91,6 +92,8 @@ async def test_complete_research_to_position_close_evidence_chain(session):
         configuration={"fast": 5, "slow": 20}, notes="deterministic test",
     ))
     session.commit()
+    add_passes(session, version.id)  # the remaining research methods (fixture evidence)
+    session.commit()
     repository.transition(strategy.id, "approved", "validation pass")
     repository.transition(strategy.id, "active", "operator activation")
     session.add(PortfolioSnapshot(
@@ -99,7 +102,7 @@ async def test_complete_research_to_position_close_evidence_chain(session):
     ))
     session.commit()
 
-    result = await TradingPipeline(session, Settings(), EventBus()).evaluate(
+    result = await TradingPipeline(session, Settings(**LEGACY), EventBus()).evaluate(
         MarketSnapshot("BTCUSDT", 65_000, 2_000, .3, .0001, "trending", "BULLISH")
     )
     assert result["risk_outcome"] == "APPROVED"

@@ -126,7 +126,8 @@ class DecisionReasoner:
 
         macro = macro_as_of(self.session, at)
         historical: dict[str, Any] = {"status": "insufficient"}
-        frame = load_candles(self.session, snapshot.exchange, snapshot.symbol, snapshot.timeframe, 300)
+        frame = load_candles(self.session, snapshot.exchange, snapshot.symbol, snapshot.timeframe, 300,
+                             until=at - TIMEFRAME_DELTA.get(snapshot.timeframe, timedelta(hours=1)))
         features = context_features(frame) if not frame.empty else {}
         if features:
             analogues = MarketMemoryService(self.session).similar(
@@ -154,6 +155,10 @@ class DecisionReasoner:
             verdict, reason = "TRADE_PROPOSAL", "setup confirmed with more supporting than contradicting evidence"
         return {
             "decision": verdict, "reason": reason, "asset": snapshot.symbol, "direction": "LONG",
+            "exchange": snapshot.exchange,
+            "strategy_risk": {"stop_loss_pct": risk.stop_loss_pct if risk else None,
+                              "take_profit_pct": risk.take_profit_pct if risk else None,
+                              "max_holding_bars": risk.max_holding_bars if risk else None},
             "decision_time": at.isoformat(),
             "timeframe_roles": {"context": higher, "regime": snapshot.timeframe, "setup": snapshot.timeframe,
                                 "entry": snapshot.timeframe, "risk": "risk_engine", "exit": "strategy exit rule + stop/target"},

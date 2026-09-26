@@ -244,19 +244,35 @@ async def test_gemini_adapter_request_shape_and_secret_safety():
 
 
 @pytest.mark.asyncio
-async def test_ai_trade_review_can_only_support_reject_or_fail_honestly(session):
-    rationale = {"asset": "SOLUSDT", "decision_time": NOW.isoformat(), "direction": "LONG",
-                 "supporting_evidence": [{"code": "SETUP", "detail": "EMA cross", "source": "strategy_rule"}],
-                 "contradicting_evidence": [{"code": "BTC_CONTEXT", "detail": "BTC trending down", "source": "regime_engine"}],
-                 "macro_context": {}, "news_context": []}
-    reject = {"summary": "s", "claims": [], "proposals": [{"verdict": "REJECT", "reasons": ["BTC trending down"], "size": 99}]}
-    review = await AIResearchService(session, Settings(), EventBus(), provider=FakeProvider([json.dumps(reject)])).review_trade(rationale)
-    assert review["verdict"] == "REJECT" and "size" not in review  # the AI cannot re-size or re-price
-    odd = {"summary": "s", "claims": [], "proposals": [{"verdict": "BUY MORE"}]}
-    rationale["decision_time"] = (NOW + timedelta(minutes=1)).isoformat()
-    review = await AIResearchService(session, Settings(), EventBus(), provider=FakeProvider([json.dumps(odd)])).review_trade(rationale)
-    assert review["verdict"] == "UNCERTAIN"
-    rationale["decision_time"] = (NOW + timedelta(minutes=2)).isoformat()
-    down = FakeProvider([AIProviderError("400 bad", retryable=False)])
-    review = await AIResearchService(session, Settings(), EventBus(), provider=down).review_trade(rationale)
-    assert review["status"] == "UNAVAILABLE" and review["verdict"] is None  # no fabricated opinion
+async def test_ai_trade_decision_is_structured_and_fails_safe(session):
+    def rationale(minute: int) -> dict:
+        return {"asset": "SOLUSDT", "exchange": "binance", "decision_time": (NOW + timedelta(minutes=minute)).isoformat(),
+                "direction": "LONG", "timeframe_roles": {"setup": "1h"},
+                "supporting_evidence": [{"code": "SETUP", "detail": "EMA cross", "source": "strategy_rule"}],
+                "contradicting_evidence": [{"code": "BTC_CONTEXT", "detail": "BTC trending down", "source": "regime_engine"}],
+                "macro_context": {}, "news_context": []}
+
+    def service(*responses):
+        return AIResearchService(session, Settings(), EventBus(), provider=FakeProvider(list(responses)))
+
+    trade = {"summary": "s", "claims": [], "proposals": [{"decision": "TRADE", "direction": "LONG", "entry": 100,
+             "stop_loss": 97, "take_profit": 106, "thesis": "breakout", "invalidation": "close below 97",
+             "confidence": 0.6, "evidence": ["support:0"], "size": 99}]}
+    review = await service(json.dumps(trade)).review_trade(rationale(0))
+    assert review["decision"] == "TRADE" and review["stop_loss"] == 97 and "size" not in review  # never sizes
+    no_trade = {"summary": "s", "claims": [], "proposals": [{"decision": "NO_TRADE", "reasons": ["BTC trending down"]}]}
+    review = await service(json.dumps(no_trade)).review_trade(rationale(1))
+    assert review["decision"] == "NO_TRADE" and review["verdict"] == "REJECT"
+    bad_levels = {"summary": "s", "claims": [], "proposals": [{"decision": "TRADE", "direction": "LONG", "entry": 100,
+                  "stop_loss": 101, "take_profit": 106, "confidence": 0.9}]}
+    review = await service(json.dumps(bad_levels)).review_trade(rationale(2))
+    assert review["decision"] == "NO_TRADE" and review["validation_problems"]
+    short = {"summary": "s", "claims": [], "proposals": [{"decision": "TRADE", "direction": "SHORT", "entry": 100,
+             "stop_loss": 103, "take_profit": 94, "confidence": 0.9}]}
+    assert (await service(json.dumps(short)).review_trade(rationale(3)))["decision"] == "NO_TRADE"
+    malformed = await service("I think SOL goes up").review_trade(rationale(4))
+    assert malformed["status"] == "MALFORMED_RESPONSE" and malformed["decision"] is None
+    failing = FakeProvider([AIProviderError("503 high demand", retryable=True)] * 5)
+    down = await AIResearchService(session, Settings(), EventBus(), provider=failing,
+                                   gateway=AIGateway(session, Settings(), failing, sleep=no_sleep)).review_trade(rationale(5))
+    assert down["status"] == "UNAVAILABLE" and down["decision"] is None  # no fabricated opinion

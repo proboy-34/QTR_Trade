@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from app.core.config import Settings
 from app.core.decimal_math import ONE, ZERO, decimal, money, price
 from app.core.events import Event, EventBus, publish_persisted
+from app.global_services.quotes import QuoteProvider
 from app.memory.trade_memory import TradeMemoryService
 from app.models import Position, PositionEvent, StrategyVersion
 from app.research.dsl import spec_from_version
@@ -29,8 +30,9 @@ def exit_reason(position: Position, mark: Decimal) -> str | None:
 class PaperTradingLoop:
     """Deterministic, restart-safe coordinator for validated market snapshots."""
 
-    def __init__(self, session: Session, settings: Settings, event_bus: EventBus) -> None:
+    def __init__(self, session: Session, settings: Settings, event_bus: EventBus, quote_provider: QuoteProvider | None = None) -> None:
         self.session, self.settings, self.event_bus = session, settings, event_bus
+        self.quote_provider = quote_provider
 
     def exit_fill(self, position: Position, mark: Decimal) -> Decimal:
         """Protective exits are market orders: slippage and half the spread apply against us.
@@ -41,8 +43,14 @@ class PaperTradingLoop:
         return price(mark * (ONE - adverse if position.side == "BUY" else ONE + adverse))
 
     async def _close(self, position: Position, mark: Decimal, reason: str, source: str) -> None:
-        manager = PositionManager(self.session, self.settings.paper_fee_rate)
         exit_price = self.exit_fill(position, mark)
+        await self.close_at(position, exit_price, reason, source, money(abs(mark - exit_price) * decimal(position.quantity)))
+
+    async def close_at(self, position: Position, exit_price: Decimal, reason: str, source: str,
+                       slippage_cost: Decimal | None = None) -> None:
+        """Close at an already-determined paper exit price (testnet positions exit on the testnet)."""
+        manager = PositionManager(self.session, self.settings.paper_fee_rate)
+        mark = exit_price
         if position.venue == "testnet":
             from app.execution.binance_testnet import BinanceTestnetExchange
 
@@ -55,7 +63,7 @@ class PaperTradingLoop:
                 self.session.commit()
                 return
             exit_price = filled or exit_price
-        manager.close(position, exit_price, reason)
+        manager.close(position, exit_price, reason, slippage_cost)
         trade = TradeMemoryService(self.session).record(position)
         await publish_persisted(
             self.session, self.event_bus,
@@ -77,7 +85,7 @@ class PaperTradingLoop:
         return "strategy_exit" if signals and signals["exit"] else None
 
     async def process(self, snapshot: MarketSnapshot) -> dict:
-        decision = await TradingPipeline(self.session, self.settings, self.event_bus).evaluate(snapshot)
+        decision = await TradingPipeline(self.session, self.settings, self.event_bus, self.quote_provider).evaluate(snapshot)
         closed: list[str] = []
         managed: list[str] = []
         positions = self.session.scalars(select(Position).where(

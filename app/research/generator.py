@@ -12,8 +12,9 @@ from sqlalchemy.orm import Session
 from app.core.config import Settings
 from app.core.events import EventBus
 from app.core.lineage import fingerprint
+from app.global_services.universe import UniverseService
 from app.models import Hypothesis, Opportunity
-from app.research.hypotheses import HypothesisEngine
+from app.research.hypotheses import TERMINAL, HypothesisEngine
 
 TEMPLATES: dict[str, dict[str, Any]] = {
     "BREAKOUT_UP": {
@@ -84,6 +85,38 @@ class ResearchGenerator:
                     description=f"Generated from scanner signal {signal.get('code')} on opportunity {opportunity.id}.",
                     market_conditions={"signal": signal, "regime": opportunity.regime},
                     variables={"exchange": opportunity.exchange, "opportunity_id": opportunity.id},
+                    assumptions=["Signal definitions use only closed-candle information",
+                                 "Costs follow the configured paper model"],
+                )
+                known.add(key)
+                created.append(hypothesis.id)
+                if len(created) >= limit:
+                    return created
+        return created
+
+    def baseline(self, limit: int = 2) -> list[str]:
+        """When the research backlog is empty, test the reviewed templates on the most liquid
+        eligible assets. These are ordinary hypotheses: every gate applies and most are expected
+        to fail — a rejected idea is recorded, never a manufactured strategy."""
+        backlog = self.session.scalar(select(Hypothesis.id).where(Hypothesis.stage.notin_(list(TERMINAL))).limit(1))
+        if backlog:
+            return []
+        known = self._known()
+        created: list[str] = []
+        engine = HypothesisEngine(self.session, self.settings, self.event_bus)
+        timeframe = self.settings.csv("scanner_timeframes")[0]
+        symbols = UniverseService.eligible_symbols(self.session, self.settings.scanner_exchange)
+        for symbol in symbols:
+            for code in ("TREND_CHANGE_UP", "BREAKOUT_UP", "VOLATILITY_EXPANSION"):
+                template = TEMPLATES[code]
+                spec: dict[str, Any] = {**template["spec"], "universe": [symbol], "timeframes": [timeframe]}
+                key = fingerprint(spec)
+                if key in known:
+                    continue
+                hypothesis = engine.create(
+                    template["statement"].format(symbol=symbol), origin="research_baseline", spec=spec,
+                    description=f"Baseline research programme: reviewed template {code} on liquid eligible asset {symbol}.",
+                    market_conditions={"template": code}, variables={"exchange": self.settings.scanner_exchange},
                     assumptions=["Signal definitions use only closed-candle information",
                                  "Costs follow the configured paper model"],
                 )

@@ -36,6 +36,10 @@ class ValidationGates:
     min_deflated_sharpe: float = 0.95
     min_oos_excess_return_pct: float = 0.0
     is_fraction: float = 0.7
+    # Regime testing: trades must span several market regimes, and no regime with enough
+    # evidence (>= 5 trades) may be a clear loser. Regime-restricted specs need only one regime.
+    min_regimes_traded: int = 2
+    min_regime_profit_factor: float = 0.6
     min_paper_trades: int = 10
     min_paper_profit_factor: float = 1.0
 

@@ -54,12 +54,14 @@ def healthy_handler(request: httpx.Request) -> httpx.Response:
 
 @pytest.mark.asyncio
 async def test_verification_records_real_states_including_plan_restrictions(session):
-    settings = Settings(**KEYS)
+    settings = Settings(**KEYS, binance_public_base_url="https://data-api.binance.vision")
     result = await ProviderVerifier(settings, httpx.MockTransport(healthy_handler), sleep=no_sleep).run(session)
     providers = result["providers"]
-    # Binance public data healthy; the key cannot be verified without a secret -> DEGRADED, not "connected".
-    assert providers["binance"]["state"] == "DEGRADED"
-    assert next(c for c in providers["binance"]["checks"] if c["check"] == "api_key")["result"] == "SKIPPED"
+    # Public market data and authenticated account access are separate components: the key
+    # cannot be verified without its secret, which never degrades public data.
+    assert providers["binance"]["state"] == "HEALTHY"
+    assert providers["binance_account"]["state"] == "NOT_CONFIGURED"
+    assert "BINANCE_API_SECRET" in providers["binance_account"]["checks"][0]["detail"]
     assert providers["gemini"]["state"] == "HEALTHY"
     # News works but the economic calendar is not on this plan: reported, not pretended.
     calendar = next(c for c in providers["finnhub"]["checks"] if c["check"] == "economic_calendar")
@@ -105,7 +107,8 @@ async def test_network_failures_malformed_payloads_and_missing_keys(session):
             return httpx.Response(200, json={"unexpected": True})
         return httpx.Response(200, text="not json")
 
-    result = await ProviderVerifier(Settings(**KEYS), httpx.MockTransport(broken), sleep=no_sleep).run(session, ("finnhub", "fred", "binance"))
+    result = await ProviderVerifier(Settings(**KEYS, binance_public_base_url="https://data-api.binance.vision"),
+                                    httpx.MockTransport(broken), sleep=no_sleep).run(session, ("finnhub", "fred", "binance"))
     assert all(result["providers"][name]["state"] == "UNAVAILABLE" for name in ("finnhub", "fred", "binance"))
     news = result["providers"]["finnhub"]["checks"][0]
     assert "finnhub-secret-123" not in news["detail"] and "token=••••" in news["detail"]

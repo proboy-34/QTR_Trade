@@ -55,7 +55,7 @@ async def lifespan(_: FastAPI):
         initial = {"safety_monitor": 15, "universe_refresh": 10, "market_data_sync": 30, "market_scan": 90,
                    "news_ingestion": 45, "research_queue": 180, "learning": 240, "data_integrity": 600,
                    "opportunity_cleanup": 600, "provider_verification": 5, "macro_ingestion": 60,
-                   "testnet_reconciliation": 20}
+                   "testnet_reconciliation": 20, "closed_candle_cycle": 40}
         for name, (interval, job) in jobs(context).items():
             orchestrator.schedule(name, interval, scheduled(context, name, job), initial.get(name))
     notifier = TelegramNotifier(settings)

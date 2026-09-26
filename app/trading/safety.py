@@ -1,6 +1,7 @@
 """Global safety layer and kill switch.
 
-Scopes: SYSTEM, PAPER_TRADING, NEW_ORDERS, STRATEGY:<id>, ASSET:<symbol>. Any active
+Scopes: EMERGENCY and SYSTEM (global), PAPER_TRADING and NEW_ORDERS (execution),
+STRATEGY:<id>, ASSET:<symbol>. Any active
 control blocks new trades. Protective exits (stops/targets) keep running, because
 closing risk is always allowed. Automatic triggers persist until an operator clears them.
 """
@@ -18,8 +19,9 @@ from app.core.time import TimeService
 from app.models import Order, PortfolioSnapshot, Position, SafetyControl
 from app.trading.accounts import VENUES, latest_portfolio
 
-SCOPES = ("SYSTEM", "PAPER_TRADING", "NEW_ORDERS", "STRATEGY", "ASSET")
-GLOBAL_BLOCKING = ("SYSTEM", "PAPER_TRADING", "NEW_ORDERS")
+SCOPES = ("EMERGENCY", "SYSTEM", "PAPER_TRADING", "NEW_ORDERS", "STRATEGY", "ASSET")
+GLOBAL_BLOCKING = ("EMERGENCY", "SYSTEM", "PAPER_TRADING", "NEW_ORDERS")
+HALTING = ("EMERGENCY", "SYSTEM")
 
 
 class SafetyService:
@@ -42,7 +44,7 @@ class SafetyService:
         return sorted(set(reasons))
 
     def evaluation_halted(self) -> list[str]:
-        return [f"SAFETY_{c.scope}_STOP" for c in self.active() if c.scope in {"SYSTEM", "PAPER_TRADING"}]
+        return [f"SAFETY_{c.scope}_STOP" for c in self.active() if c.scope in {"EMERGENCY", "SYSTEM", "PAPER_TRADING"}]
 
     def activate(self, scope: str, reason: str, *, target: str = "*", trigger: str = "OPERATOR",
                  source: str = "operator", details: dict[str, Any] | None = None) -> tuple[SafetyControl, bool]:

@@ -67,7 +67,11 @@ class TradeMemoryService:
         net = money(realized - fees)
         notional = entry * filled
         reference = decimal(intent.entry_price) if intent else None
-        slippage = money((entry - reference) * filled * direction) if reference is not None else ZERO
+        # Entry + exit slippage recorded by the paper venue against real quotes; legacy rows fall
+        # back to the distance between the decision reference price and the fill.
+        recorded = decimal(position.slippage_cost or 0)
+        slippage = (money(recorded) if recorded > ZERO else
+                    money((entry - reference) * filled * direction) if reference is not None else ZERO)
         stop_distance = abs(entry - decimal(position.stop_loss)) * filled
         opened_at = TimeService.ensure_utc(position.opened_at)
         closed_at = TimeService.ensure_utc(position.closed_at)

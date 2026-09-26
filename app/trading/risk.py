@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -10,6 +10,7 @@ from app.core.config import Settings
 from app.core.decimal_math import ONE, ZERO, decimal, money, price, quantity, rate
 from app.core.time import TimeService
 from app.global_services.historical import TIMEFRAME_DELTA
+from app.global_services.quotes import Quote
 from app.models import (
     Asset,
     AssetEligibility,
@@ -20,6 +21,7 @@ from app.models import (
     TradeIntent,
 )
 from app.trading.accounts import latest_portfolio, venue_for
+from app.trading.eligibility import check as eligibility_check
 from app.trading.portfolio_intelligence import PortfolioIntelligence
 from app.trading.safety import SafetyService
 
@@ -32,6 +34,11 @@ class MarketFacts:
     timeframe: str
     observed_at: datetime
     last_candle_at: datetime | None
+    # Real top-of-book quote for execution (required for real exchanges when require_quote).
+    quote: Quote | None = None
+    require_quote: bool = False
+    # Provider/data failures observed by the caller for this decision (any -> reject).
+    provider_errors: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -92,10 +99,17 @@ class RiskEngine:
             select(StrategyVersion.strategy_id).where(StrategyVersion.id == intent.strategy_version_id)
         )
         reasons.extend(SafetyService(self.session).blocks_new_orders(strategy_id, intent.symbol))
+        # Independent of the Decision layer: only validated, paper-eligible strategies may trade.
+        eligibility = eligibility_check(self.session, self.settings, self.session.get(StrategyVersion, intent.strategy_version_id))
+        if not eligibility.eligible:
+            reasons.append("STRATEGY_NOT_PAPER_ELIGIBLE")
         if self.venue == "none":
             reasons.append("EXECUTION_DISABLED")
         if facts is not None:
             reasons.extend(self._market_checks(intent.symbol, facts))
+            if facts.quote is not None and not reasons:
+                # Execution reference is the real touch price (ask for a buy), not the candle close.
+                market = price(facts.quote.ask if intent.side == "BUY" else facts.quote.bid)
         if reasons:
             return self._record(intent, RiskAssessment(False, reasons))
 
@@ -115,6 +129,11 @@ class RiskEngine:
         if target_fraction / stop_fraction < decimal(self.settings.min_reward_risk):
             reasons.append("REWARD_RISK_BELOW_MINIMUM")
             return self._record(intent, RiskAssessment(False, reasons))
+        long_ok = intent.side == "BUY" and ZERO < stop_loss < market < take_profit
+        short_ok = intent.side == "SELL" and ZERO < take_profit < market < stop_loss
+        if not (long_ok or short_ok):
+            reasons.append("INVALID_STOP_OR_TARGET")
+            return self._record(intent, RiskAssessment(False, reasons))
         risk_amount = money(equity * decimal(self.settings.max_risk_per_trade))
         raw_quantity = risk_amount / abs(market - stop_loss)
         remaining_exposure = max(ZERO, decimal(self.settings.max_total_exposure) - exposure)
@@ -132,9 +151,13 @@ class RiskEngine:
             return self._record(intent, RiskAssessment(False, reasons), portfolio_view)
         raw_quantity = min(raw_quantity, equity * budget / market)
         leverage = min(ONE, decimal(self.settings.max_leverage))
-        instrument = self.session.scalar(select(AssetInstrument).where(
-            AssetInstrument.exchange == "paper", AssetInstrument.exchange_symbol == intent.symbol
-        ))
+        # Size to the real exchange's filters when the market data comes from one.
+        instrument = None
+        for exchange in ([facts.exchange] if facts is not None else []) + ["paper"]:
+            instrument = self.session.scalar(select(AssetInstrument).where(
+                AssetInstrument.exchange == exchange, AssetInstrument.exchange_symbol == intent.symbol))
+            if instrument:
+                break
         asset = self.session.scalar(select(Asset).where(Asset.symbol == intent.symbol))
         step_size = instrument.step_size if instrument else (asset.step_size if asset else None)
         final_quantity = quantity(raw_quantity, step_size)
@@ -148,6 +171,12 @@ class RiskEngine:
         required_margin = money(notional / leverage)
         if required_margin > available:
             reasons.append("INSUFFICIENT_MARGIN")
+        # Hard caps re-checked on the final numbers (defence in depth against sizing bugs).
+        if equity > ZERO and notional > equity * decimal(self.settings.max_symbol_concentration) * decimal("1.0001"):
+            reasons.append("POSITION_TOO_LARGE")
+        actual_risk = abs(market - stop_loss) * final_quantity
+        if equity > ZERO and actual_risk > equity * decimal(self.settings.max_risk_per_trade) * decimal("1.0001"):
+            reasons.append("RISK_PER_TRADE_EXCEEDED")
         assessment = RiskAssessment(
             not reasons,
             reasons,
@@ -162,14 +191,24 @@ class RiskEngine:
 
     def _market_checks(self, symbol: str, market: MarketFacts) -> list[str]:
         """Data freshness, liquidity and spread gates. Missing evidence on a real exchange rejects."""
-        reasons: list[str] = []
+        reasons: list[str] = [f"PROVIDER_FAILURE:{item}" for item in market.provider_errors]
         interval = TIMEFRAME_DELTA.get(market.timeframe, timedelta(hours=1))
         if market.last_candle_at is None:
             reasons.append("NO_MARKET_DATA")
         else:
             age = TimeService.ensure_utc(market.observed_at) - TimeService.ensure_utc(market.last_candle_at)
-            if age > interval * (self.settings.market_data_max_age_bars + 1):
+            if age < timedelta(0):
+                reasons.append("LOOKAHEAD_VIOLATION")  # data newer than the decision time
+            elif age > interval * (self.settings.market_data_max_age_bars + 1):
                 reasons.append("STALE_MARKET_DATA")
+        if market.quote is None and market.require_quote:
+            reasons.append("QUOTE_UNAVAILABLE")
+        elif market.quote is not None:
+            quote_age = (TimeService.now() - TimeService.ensure_utc(market.quote.observed_at)).total_seconds()
+            if quote_age > self.settings.quote_max_age_seconds:
+                reasons.append("STALE_QUOTE")
+            if market.quote.spread_bps > decimal(self.settings.universe_max_spread_bps):
+                reasons.append("SPREAD_TOO_WIDE")
         if market.exchange in {"paper"}:
             return reasons  # synthetic demo data has no liquidity statistics (demo mode only)
         eligibility = self.session.scalar(select(AssetEligibility).where(

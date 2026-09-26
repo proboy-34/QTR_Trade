@@ -45,7 +45,7 @@ from app.models import (
 )
 from app.research.generator import ResearchGenerator
 from app.research.hypotheses import TERMINAL, HypothesisEngine
-from app.trading.safety import SafetyMonitor, SafetyService
+from app.trading.safety import HALTING, SafetyMonitor, SafetyService
 
 logger = logging.getLogger("qtr.jobs")
 SessionFactory = Callable[[], Session]
@@ -113,7 +113,7 @@ def scan_symbols(session: Session, settings: Settings, exchange: str, timeframe:
 
 
 def system_halted(session: Session) -> bool:
-    return any(control.scope == "SYSTEM" for control in SafetyService(session).active())
+    return any(control.scope in HALTING for control in SafetyService(session).active())
 
 
 def jobs(context: JobContext) -> dict[str, tuple[int, Callable[[Session], Awaitable[dict[str, Any]]]]]:
@@ -142,7 +142,8 @@ def jobs(context: JobContext) -> dict[str, tuple[int, Callable[[Session], Awaita
                     MarketCandle.exchange == exchange, MarketCandle.symbol == symbol, MarketCandle.timeframe == timeframe,
                 ).order_by(desc(MarketCandle.timestamp)))
                 start = (TimeService.ensure_utc(latest) + TIMEFRAME_DELTA[timeframe]) if latest else (
-                    last_closed - TIMEFRAME_DELTA[timeframe] * (settings.universe_min_history_candles + 100))
+                    last_closed - TIMEFRAME_DELTA[timeframe] * max(settings.research_history_candles,
+                                                                  settings.universe_min_history_candles + 100))
                 if start > last_closed:
                     continue
                 service = HistoricalBackfillService(session)
@@ -202,7 +203,8 @@ def jobs(context: JobContext) -> dict[str, tuple[int, Callable[[Session], Awaita
     async def research_queue(session: Session) -> dict[str, Any]:
         if system_halted(session) or not settings.autonomous_research_enabled:
             return {"skipped": "SYSTEM_STOP" if system_halted(session) else "AUTONOMOUS_RESEARCH_ENABLED=false"}
-        generated = ResearchGenerator(session, settings, bus).from_opportunities(limit=2)
+        generator = ResearchGenerator(session, settings, bus)
+        generated = generator.from_opportunities(limit=2) or generator.baseline(limit=2)
         ai_result: dict[str, Any] | None = None
         provider = build_provider(settings)
         if provider.configured:
@@ -278,6 +280,11 @@ def jobs(context: JobContext) -> dict[str, tuple[int, Callable[[Session], Awaita
                     report[f"{symbol}:{timeframe}"] = {"missing_candles": gaps, "stale": stale}
         return {"issues": report, "checked_at": TimeService.now().isoformat()}
 
+    async def closed_candle_cycle(session: Session) -> dict[str, Any]:
+        from app.trading.candle_cycle import ClosedCandleCycle
+
+        return await ClosedCandleCycle(context.session_factory, settings, bus).run()
+
     async def safety_monitor(session: Session) -> dict[str, Any]:
         state = context.live_state() if context.live_state else None
         return await SafetyMonitor(session, settings, bus).check(state)
@@ -296,9 +303,15 @@ def jobs(context: JobContext) -> dict[str, tuple[int, Callable[[Session], Awaita
         registered["testnet_reconciliation"] = (300, testnet_reconciliation)
     if settings.market_scanner_enabled:
         registered["universe_refresh"] = (settings.universe_refresh_seconds, universe_refresh)
-        registered["market_scan"] = (settings.scanner_interval_seconds, market_scan)
-    if settings.market_sync_enabled:
-        registered["market_data_sync"] = (settings.market_sync_interval_seconds, market_data_sync)
+    if settings.candle_cycle_enabled:
+        # The REST closed-candle cycle syncs, scans, decides and monitors; the standalone sync and
+        # scan jobs would repeat the same work, so they only run when the cycle is disabled.
+        registered["closed_candle_cycle"] = (settings.candle_cycle_interval_seconds, closed_candle_cycle)
+    else:
+        if settings.market_scanner_enabled:
+            registered["market_scan"] = (settings.scanner_interval_seconds, market_scan)
+        if settings.market_sync_enabled:
+            registered["market_data_sync"] = (settings.market_sync_interval_seconds, market_data_sync)
     return registered
 
 
@@ -320,6 +333,9 @@ JOB_PURPOSE = {
     "universe_refresh": "Rebuild the eligible Binance universe from exchange metadata",
     "market_scan": "Scan eligible assets for unusual conditions (never trades)",
     "market_data_sync": "Backfill closed candles for eligible assets from Binance",
+    "closed_candle_cycle": ("REST closed-candle loop: sync closed candles, monitor paper positions (stop/target/"
+                            "strategy exit/time), scan, then decide per asset once per candle (idempotent ledger) "
+                            "through Gemini and Risk to paper execution"),
     "testnet_reconciliation": "Refresh non-final testnet orders and testnet balances",
 }
 RETRY_POLICY = "No immediate retry: a failed run is recorded as FAILED and retried at the next scheduled run; provider calls retry transient errors internally."
