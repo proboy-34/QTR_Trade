@@ -12,6 +12,10 @@ for _name in ("BINANCE_API_KEY", "BINANCE_API_SECRET", "BINANCE_TESTNET_API_KEY"
               "GEMINI_API_KEY", "FINNHUB_API_KEY", "FRED_API_KEY", "TELEGRAM_BOT_TOKEN", "AUTH_TOKENS"):
     os.environ[_name] = ""
 os.environ["EXECUTION_MODE"] = "paper"
+# Operator-specific provider settings in a local .env must not change test behaviour either.
+os.environ["FINNHUB_NEWS_ENABLED"] = "true"
+os.environ["FINNHUB_CALENDAR_ENABLED"] = "true"
+os.environ["BINANCE_PUBLIC_BASE_URL"] = "https://data-api.binance.vision"
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker

@@ -9,6 +9,7 @@ import pandas as pd
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.core.decimal_math import decimal, rate
 from app.core.time import TimeService
 from app.global_services.market_data import MarketDataQuality
@@ -105,7 +106,7 @@ class SyntheticHistoricalProvider:
 
 HISTORICAL_PROVIDERS: dict[str, HistoricalCandleProvider] = {
     "paper": SyntheticHistoricalProvider(),
-    "binance": BinanceHistoricalProvider(),
+    "binance": BinanceHistoricalProvider(get_settings().binance_public_base_url),
     "okx": OKXHistoricalProvider(),
     "bybit": BybitHistoricalProvider(),
 }

@@ -51,7 +51,9 @@ class Settings(BaseSettings):
 
     # Multi-asset universe (public exchange metadata; no credentials required)
     universe_provider: Literal["binance"] = "binance"
-    binance_public_base_url: str = "https://api.binance.com"
+    # Public market data only (no keys). data-api.binance.vision is Binance's official
+    # market-data-only host; it serves no account or order endpoints.
+    binance_public_base_url: str = "https://data-api.binance.vision"
     binance_ws_base_url: str = "wss://stream.binance.com:9443"
     universe_quote_assets: str = "USDT"
     universe_min_quote_volume_24h: float = Field(20_000_000, ge=0)

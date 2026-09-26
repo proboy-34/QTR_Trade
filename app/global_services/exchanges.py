@@ -4,6 +4,8 @@ from typing import Any, Protocol
 
 import httpx
 
+from app.core.config import get_settings
+
 
 class PrivateExecutionAdapter(Protocol):
     """Future authenticated boundary. No live implementation is registered in V1."""
@@ -37,6 +39,9 @@ class ExchangeAdapter(ABC):
 
 class BinanceAdapter(ExchangeAdapter):
     name, base_url = "binance", "https://api.binance.com"
+
+    def __init__(self, base_url: str | None = None) -> None:
+        self.base_url = base_url or self.base_url
 
     async def ticker(self, symbol: str) -> dict:
         data = await self._get("/api/v3/ticker/24hr", {"symbol": symbol})
@@ -79,7 +84,7 @@ class BybitAdapter(ExchangeAdapter):
 
 
 EXCHANGES: dict[str, ExchangeAdapter] = {
-    "binance": BinanceAdapter(),
+    "binance": BinanceAdapter(get_settings().binance_public_base_url),
     "okx": OKXAdapter(),
     "bybit": BybitAdapter(),
 }
