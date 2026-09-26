@@ -29,6 +29,31 @@ See [docs/AUTONOMOUS_TRADING_ROADMAP.md](docs/AUTONOMOUS_TRADING_ROADMAP.md) (cu
 
 Implementation boundaries are documented in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), and the requirement-by-requirement result is in [docs/ARCHITECTURE_AUDIT.md](docs/ARCHITECTURE_AUDIT.md). Operational guides cover [paper trading](docs/PAPER_TRADING.md), [market data](docs/MARKET_DATA.md), [recovery](docs/RECOVERY.md), [testing](docs/TESTING.md), [production readiness](docs/PRODUCTION_READINESS.md), and [safety](docs/SAFETY.md).
 
+## One-Click Windows Startup
+
+1. Open `E:\QTR` (the QTR_Trade folder).
+2. Double-click `RUN_QTR.bat`.
+3. Wait for the browser to open at `http://127.0.0.1:5173`. The first run installs packages and can take a few minutes.
+4. QTR_Trade is now running in **paper mode**: live trading is disabled and the paper capital is $100,000.
+5. To stop it, double-click `STOP_QTR.bat`. `STATUS_QTR.bat` shows whether it is running and healthy.
+
+`RUN_QTR.bat` does the following:
+
+- checks for Python 3.12+, Node.js, npm, Git and your `.env`; it never prints or changes your keys;
+- reuses `.venv` and `frontend\node_modules`, installing them only if they are missing;
+- applies pending database migrations only, and never resets data or the paper account;
+- opens two windows, **QTR_Trade Backend** (`uvicorn app.main:app` on port 8000, without `--reload`, with the scheduler and paper loop running) and **QTR_Trade Frontend** (Vite on port 5173);
+- waits until both are healthy, then opens the browser;
+- if they are already running, it does not start a second copy; if another program holds port 8000 or 5173, it says so and stops.
+
+`STOP_QTR.bat` stops only the processes `RUN_QTR.bat` started. It never touches the database, logs, configuration or the paper account.
+
+Keep in mind:
+
+- This runs **locally on your computer**; it is not cloud-hosted. The computer must stay on and awake, with internet access, for continuous paper trading.
+- Closing the browser does **not** stop QTR_Trade. Closing the Backend/Frontend windows, running `STOP_QTR.bat`, or shutting down the computer **does** stop it.
+- After a restart, QTR_Trade continues from its database: processed candles are not repeated and open paper positions are kept.
+
 ## Quick start (local demo)
 
 Python 3.12+ and Node 22+ are required.

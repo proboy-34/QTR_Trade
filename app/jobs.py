@@ -1,5 +1,6 @@
 """Scheduled autonomous work. Every job is idempotent, restart-safe and persisted as a JobExecution."""
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -59,8 +60,27 @@ class JobContext:
     live_state: Callable[[], dict[str, Any]] | None = None
 
 
+_JOB_LOCK: asyncio.Lock | None = None
+
+
+def job_lock() -> asyncio.Lock:
+    """One scheduled job at a time per process. The SQLite driver waits for locks synchronously,
+    so two jobs interleaving on one event loop (one holding a write transaction across a network
+    await) would stall each other until "database is locked". Jobs are mostly network-bound, so
+    running them one after another costs little and makes every run reliable."""
+    global _JOB_LOCK
+    if _JOB_LOCK is None:
+        _JOB_LOCK = asyncio.Lock()
+    return _JOB_LOCK
+
+
 async def run_job(context: JobContext, name: str, job: Callable[[Session], Awaitable[dict[str, Any]]]) -> dict[str, Any]:
     """Persist the run, its outcome and details; failures are recorded and re-raised to the scheduler."""
+    async with job_lock():
+        return await _run_job(context, name, job)
+
+
+async def _run_job(context: JobContext, name: str, job: Callable[[Session], Awaitable[dict[str, Any]]]) -> dict[str, Any]:
     with context.session_factory() as session:
         execution = JobExecution(job_name=name, status="RUNNING")
         session.add(execution)

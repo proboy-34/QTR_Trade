@@ -27,6 +27,9 @@ Gemini and Risk all agree.
 
 ## Start (Windows, `E:\QTR`)
 
+The simplest way is to double-click `RUN_QTR.bat` in `E:\QTR` (see the README section "One-Click Windows Startup").
+It runs the steps below for you, opens the browser, and `STOP_QTR.bat` stops it again. The manual steps are:
+
 ```powershell
 cd E:\QTR
 git fetch origin claude/sweet-hawking-joq2hh
