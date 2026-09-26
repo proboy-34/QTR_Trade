@@ -42,7 +42,7 @@ Implementation boundaries are documented in [docs/ARCHITECTURE.md](docs/ARCHITEC
 - checks for Python 3.12+, Node.js, npm, Git and your `.env`; it never prints or changes your keys;
 - reuses `.venv` and `frontend\node_modules`, installing them only if they are missing;
 - applies pending database migrations only, and never resets data or the paper account;
-- opens two windows, **QTR_Trade Backend** (`uvicorn app.main:app` on port 8000, without `--reload`, with the scheduler and paper loop running) and **QTR_Trade Frontend** (Vite on port 5173);
+- opens two windows, **QTR_Trade Backend** (`uvicorn app.main:app` on `127.0.0.1:8000`, without `--reload`, with the scheduler and paper loop running) and **QTR_Trade Frontend** (Vite on `127.0.0.1:5173`). Both are reachable only from this computer, not from other devices on your network;
 - waits until both are healthy, then opens the browser;
 - if they are already running, it does not start a second copy; if another program holds port 8000 or 5173, it says so and stops.
 

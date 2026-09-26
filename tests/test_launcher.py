@@ -55,3 +55,15 @@ async def test_scheduled_jobs_never_interleave(session):
     await asyncio.gather(run_job(context, "first", job("first")), run_job(context, "second", job("second")))
     assert timeline in (["first:start", "first:end", "second:start", "second:end"],
                         ["second:start", "second:end", "first:start", "first:end"])
+
+
+def test_only_one_launcher_may_start_at_a_time(tmp_path, monkeypatch):
+    import os
+
+    monkeypatch.setattr(launcher, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(launcher, "START_LOCK", tmp_path / "starting.lock")
+    assert launcher.acquire_start_lock()          # first launcher
+    assert not launcher.acquire_start_lock()      # a second one while the first is running (its PID is alive)
+    (tmp_path / "starting.lock").write_text("999999999")  # left behind by a launcher window that was closed
+    assert launcher.acquire_start_lock()          # recovered automatically
+    assert (tmp_path / "starting.lock").read_text() == str(os.getpid())

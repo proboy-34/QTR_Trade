@@ -3,7 +3,7 @@
 Standard library only. It starts the EXISTING application exactly as documented:
 
   backend : <venv python> -m uvicorn app.main:app --host 127.0.0.1 --port 8000   (no --reload)
-  frontend: npm run dev -- --strictPort                                          (Vite, port 5173)
+  frontend: npm run dev -- --strictPort       (Vite, 127.0.0.1:5173 - this laptop only, not the LAN)
 
 It never reads or prints API keys, never edits .env, never resets the database, and only
 stops processes it started itself (their IDs are kept in .qtr/launcher.json).
@@ -39,6 +39,8 @@ FRONTEND_PORT = 5173
 BACKEND_URL = f"http://{BACKEND_HOST}:{BACKEND_PORT}"
 FRONTEND_URL = f"http://127.0.0.1:{FRONTEND_PORT}"
 BACKEND_TITLE, FRONTEND_TITLE = "QTR_Trade Backend", "QTR_Trade Frontend"
+HELPERS = {BACKEND_TITLE: "qtr_backend.cmd", FRONTEND_TITLE: "qtr_frontend.cmd"}
+START_LOCK = STATE_DIR / "starting.lock"
 
 
 # ------------------------------------------------------------------ helpers
@@ -64,9 +66,19 @@ def port_open(port: int, host: str = "127.0.0.1") -> bool:
         return sock.connect_ex((host, port)) == 0
 
 
+# Local checks must never go through a proxy configured on the laptop.
+_LOCAL = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def run_quiet(command: list[str], timeout: float = 600, cwd: Path = ROOT) -> subprocess.CompletedProcess:
+    """Run a helper command, decoding output safely whatever the Windows code page is."""
+    return subprocess.run(command, cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                          timeout=timeout)
+
+
 def get_json(url: str, timeout: float = 3) -> dict | None:
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as response:
+        with _LOCAL.open(url, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
     except (urllib.error.URLError, OSError, ValueError):
         return None
@@ -74,7 +86,7 @@ def get_json(url: str, timeout: float = 3) -> dict | None:
 
 def get_ok(url: str, timeout: float = 3) -> bool:
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as response:
+        with _LOCAL.open(url, timeout=timeout) as response:
             return 200 <= response.status < 400
     except (urllib.error.URLError, OSError):
         return False
@@ -98,13 +110,26 @@ def save_state(state: dict) -> None:
 
 
 def process_alive(pid: int | None, title: str) -> bool:
-    """True only if `pid` is still the process this launcher started (checked by window title on Windows)."""
+    """True only if `pid` is still the process this launcher started.
+
+    Windows: the process command line must contain this launcher's helper script
+    (qtr_backend.cmd / qtr_frontend.cmd), so a recycled PID or any unrelated python/node/cmd
+    process never matches. Window titles are only a fallback: Windows Terminal (the default
+    console on Windows 11) does not report them to tasklist."""
     if not pid:
         return False
     if WINDOWS:
-        result = subprocess.run(["tasklist", "/V", "/FO", "CSV", "/NH", "/FI", f"PID eq {pid}"],
-                                capture_output=True, text=True)
-        return str(pid) in result.stdout and title in result.stdout
+        helper = HELPERS[title]
+        try:
+            query = run_quiet(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                               f"(Get-CimInstance -ClassName Win32_Process -Filter 'ProcessId={int(pid)}').CommandLine"],
+                              timeout=30)
+            if query.returncode == 0:
+                return helper.lower() in query.stdout.lower()
+        except (OSError, subprocess.SubprocessError):
+            pass
+        listing = run_quiet(["tasklist", "/V", "/FO", "CSV", "/NH", "/FI", f"PID eq {int(pid)}"], timeout=30)
+        return f'"{int(pid)}"' in listing.stdout and title in listing.stdout
     try:
         os.kill(pid, 0)
     except OSError:
@@ -115,19 +140,18 @@ def process_alive(pid: int | None, title: str) -> bool:
         return False
 
 
-def start_window(title: str, script: str, command: list[str], cwd: Path, log_name: str) -> int:
+def start_window(title: str, command: list[str], cwd: Path, log_name: str) -> subprocess.Popen:
     """Start a long-running process in its own visible console window (Windows) or process group."""
     if WINDOWS:
         # The helper .cmd sets the window title, runs the command and keeps the window open on exit
-        # so any error stays readable.
-        helper = ROOT / "scripts" / "windows" / script
-        process = subprocess.Popen(["cmd.exe", "/c", str(helper)], cwd=cwd,
-                                   creationflags=subprocess.CREATE_NEW_CONSOLE)  # type: ignore[attr-defined]
-        return process.pid
+        # so any error stays readable. `cmd /d /c ""<path>""` keeps the path quoted even when the
+        # folder name contains spaces, parentheses or '&'; /d skips AutoRun commands.
+        helper = ROOT / "scripts" / "windows" / HELPERS[title]
+        return subprocess.Popen(f'cmd.exe /d /c ""{helper}""', cwd=cwd,
+                                creationflags=subprocess.CREATE_NEW_CONSOLE)  # type: ignore[attr-defined]
     LOG_DIR.mkdir(exist_ok=True)
     log = open(LOG_DIR / log_name, "ab")  # noqa: SIM115 - handed to the child process
-    process = subprocess.Popen(command, cwd=cwd, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-    return process.pid
+    return subprocess.Popen(command, cwd=cwd, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
 
 
 def stop_process(pid: int, title: str) -> bool:
@@ -135,7 +159,11 @@ def stop_process(pid: int, title: str) -> bool:
         return False
     if WINDOWS:
         # /T stops the whole tree (window -> python/node), /F because console apps ignore a polite close.
-        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, text=True)
+        run_quiet(["taskkill", "/PID", str(int(pid)), "/T", "/F"], timeout=60)
+        for _ in range(20):
+            if not process_alive(pid, title):
+                break
+            time.sleep(0.5)
     else:
         os.killpg(pid, signal.SIGTERM)
         for _ in range(100):
@@ -160,20 +188,67 @@ def wait_until(check, timeout: float, alive=None) -> bool:
 
 def safe_settings_summary() -> dict:
     """Non-secret settings only (mode flags and capital). API keys are never read into output."""
-    code = ("import json;from app.core.config import Settings;s=Settings();"
+    code = ("import json,sys\nfrom pydantic import ValidationError\nfrom app.core.config import Settings\n"
+            "try:\n    s=Settings()\n"
+            "except ValidationError as e:\n"
+            "    print(json.dumps({'errors':[(' / '.join(str(p) for p in x['loc']) or 'settings')+': '+x['msg'] "
+            "for x in e.errors(include_input=False,include_url=False,include_context=False)]}));sys.exit(3)\n"
             "print(json.dumps({'trading_mode':s.trading_mode,'execution_mode':s.execution_mode,"
             "'live_trading_enabled':s.live_trading_enabled,'demo_mode':s.demo_mode,"
             "'starting_equity':s.starting_equity,'sqlite':s.database_url.startswith('sqlite'),"
             "'database_file':s.database_url.split('///',1)[1] if s.database_url.startswith('sqlite') else None}))")
-    result = subprocess.run([str(venv_python()), "-c", code], cwd=ROOT, capture_output=True, text=True)
+    result = run_quiet([str(venv_python()), "-c", code], timeout=120)
+    if result.returncode == 3:
+        raise RuntimeError("; ".join(json.loads(result.stdout.strip().splitlines()[-1])["errors"]))
     if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "configuration could not be loaded")
+        # Only the exception type is shown: tracebacks can quote configuration values.
+        last = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else ""
+        raise RuntimeError(last.split(":", 1)[0] or "configuration could not be loaded")
     return json.loads(result.stdout.strip().splitlines()[-1])
 
 
 # ------------------------------------------------------------------ commands
+def pid_running(pid: int) -> bool:
+    """Is any process with this PID running? (Never signals it: on Windows os.kill would terminate it.)"""
+    if WINDOWS:
+        listing = run_quiet(["tasklist", "/FO", "CSV", "/NH", "/FI", f"PID eq {int(pid)}"], timeout=30)
+        return f'"{int(pid)}"' in listing.stdout
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def acquire_start_lock() -> bool:
+    """Only one RUN_QTR.bat may start QTR_Trade at a time (a quick double double-click)."""
+    STATE_DIR.mkdir(exist_ok=True)
+    try:
+        if START_LOCK.exists():
+            holder = START_LOCK.read_text(encoding="utf-8").strip()
+            too_old = time.time() - START_LOCK.stat().st_mtime > 900
+            if too_old or not (holder.isdigit() and pid_running(int(holder))):
+                START_LOCK.unlink()  # left behind by a launcher window that was closed mid-start
+        handle = os.open(START_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return False
+    os.write(handle, str(os.getpid()).encode())
+    os.close(handle)
+    return True
+
+
 def start(open_browser: bool = True) -> int:
     os.chdir(ROOT)
+    if not acquire_start_lock():
+        return fail("QTR_Trade is already being started by another RUN_QTR.bat window.",
+                    "Wait for that window to finish. If none is open, run RUN_QTR.bat again in 15 minutes.")
+    try:
+        return _start(open_browser)
+    finally:
+        START_LOCK.unlink(missing_ok=True)
+
+
+def _start(open_browser: bool) -> int:
     say("QTR_Trade is starting...")
     say(f"Project folder: {ROOT}")
 
@@ -197,14 +272,13 @@ def start(open_browser: bool = True) -> int:
 
     # 1) Database: apply pending migrations only (never resets or recreates data).
     say("Checking database migrations...")
-    migrate = subprocess.run([str(venv_python()), "-m", "alembic", "upgrade", "head"], cwd=ROOT,
-                             capture_output=True, text=True)
+    migrate = run_quiet([str(venv_python()), "-m", "alembic", "upgrade", "head"])
     if migrate.returncode != 0:
         say(migrate.stdout[-2000:])
         say(migrate.stderr[-3000:])
         return fail("Database migration failed. QTR_Trade was NOT started.",
                     "Nothing was deleted. Please share the error above for help.")
-    current = subprocess.run([str(venv_python()), "-m", "alembic", "current"], cwd=ROOT, capture_output=True, text=True)
+    current = run_quiet([str(venv_python()), "-m", "alembic", "current"])
     revision = next((line.split()[0] for line in current.stdout.splitlines() if "(head)" in line), "unknown")
     applied = [line.split("Running upgrade", 1)[1].strip() for line in migrate.stderr.splitlines() if "Running upgrade" in line]
     say(f"Database: at migration head ({revision})" + (f", applied {len(applied)} pending migration(s)" if applied else ", nothing to apply"))
@@ -218,14 +292,13 @@ def start(open_browser: bool = True) -> int:
         return fail(f"Port {BACKEND_PORT} is already used by another program (not QTR_Trade).",
                     f"Close the program using port {BACKEND_PORT} and run RUN_QTR.bat again.")
     else:
-        say("Starting backend...")
-        pid = start_window(BACKEND_TITLE, "qtr_backend.cmd",
-                           [str(venv_python()), "-m", "uvicorn", "app.main:app", "--host", BACKEND_HOST,
-                            "--port", str(BACKEND_PORT)], ROOT, "backend.log")
-        state.update({"backend_pid": pid, "backend_started_at": datetime.now(UTC).isoformat()})
+        say("Starting backend... (a new 'QTR_Trade Backend' window opens; this can take up to 3 minutes)")
+        backend = start_window(BACKEND_TITLE, [str(venv_python()), "-m", "uvicorn", "app.main:app", "--host", BACKEND_HOST,
+                                               "--port", str(BACKEND_PORT)], ROOT, "backend.log")
+        state.update({"backend_pid": backend.pid, "backend_started_at": datetime.now(UTC).isoformat()})
         save_state(state)
         ready = wait_until(lambda: is_qtr_health(get_json(f"{BACKEND_URL}/health")), 180,
-                           alive=lambda: process_alive(pid, BACKEND_TITLE))
+                           alive=lambda: backend.poll() is None)
         if not ready:
             return fail("The backend did not become healthy.",
                         "Look at the 'QTR_Trade Backend' window for the error. The browser was NOT opened.")
@@ -243,15 +316,13 @@ def start(open_browser: bool = True) -> int:
         return fail(f"Port {FRONTEND_PORT} is already used by another program (not QTR_Trade).",
                     f"Close the program using port {FRONTEND_PORT} and run RUN_QTR.bat again.")
     else:
-        say("Starting frontend...")
-        npm = "npm.cmd" if WINDOWS else "npm"
-        pid = start_window(FRONTEND_TITLE, "qtr_frontend.cmd", [npm, "run", "dev", "--", "--strictPort"], FRONTEND,
-                           "frontend.log")
-        state.update({"frontend_pid": pid, "frontend_started_at": datetime.now(UTC).isoformat()})
+        say("Starting frontend... (a new 'QTR_Trade Frontend' window opens)")
+        frontend = start_window(FRONTEND_TITLE, ["npm", "run", "dev", "--", "--strictPort"], FRONTEND, "frontend.log")
+        state.update({"frontend_pid": frontend.pid, "frontend_started_at": datetime.now(UTC).isoformat()})
         save_state(state)
         ready = wait_until(lambda: get_ok(f"http://127.0.0.1:{FRONTEND_PORT}/") and
                            is_qtr_health(get_json(f"http://127.0.0.1:{FRONTEND_PORT}/health")), 120,
-                           alive=lambda: process_alive(pid, FRONTEND_TITLE))
+                           alive=lambda: frontend.poll() is None)
         if not ready:
             return fail("The frontend did not start.",
                         "Look at the 'QTR_Trade Frontend' window for the error. The browser was NOT opened.")
@@ -259,8 +330,12 @@ def start(open_browser: bool = True) -> int:
 
     # 4) Browser, only once both sides are confirmed ready.
     if open_browser:
-        webbrowser.open(FRONTEND_URL)
-        say(f"Browser: OPENED  ({FRONTEND_URL})")
+        try:
+            opened = webbrowser.open(FRONTEND_URL)
+        except webbrowser.Error:
+            opened = False
+        say(f"Browser: OPENED  ({FRONTEND_URL})" if opened else
+            f"Browser: could not be opened automatically - open {FRONTEND_URL} yourself")
     else:
         say(f"Browser: not opened (--no-browser). Open {FRONTEND_URL}")
     summary(config)
@@ -287,18 +362,24 @@ def summary(config: dict | None = None) -> None:
 def stop() -> int:
     os.chdir(ROOT)
     state = load_state()
-    stopped = []
+    stopped, remaining = [], {}
     for key, title in (("frontend_pid", FRONTEND_TITLE), ("backend_pid", BACKEND_TITLE)):
         pid = state.get(key)
-        if pid and stop_process(int(pid), title):
+        if not pid:
+            continue
+        if stop_process(int(pid), title):
             stopped.append(title)
-    if STATE_FILE.exists():
+        if process_alive(int(pid), title):  # could not be stopped: keep tracking it
+            remaining[key] = pid
+    if remaining:
+        save_state(remaining)
+    elif STATE_FILE.exists():
         STATE_FILE.unlink()
     for name, url in (("Backend", f"{BACKEND_URL}/health"), ("Frontend", f"http://127.0.0.1:{FRONTEND_PORT}/health")):
         if wait_until(lambda url=url: not is_qtr_health(get_json(url, timeout=1)), 15):
             continue
-        say(f"NOTE: a QTR_Trade {name} is still running but was not started by RUN_QTR.bat.")
-        say("      It was left alone. Close its window yourself if you want to stop it.")
+        say(f"NOTE: a QTR_Trade {name} is still running. It was not started by this RUN_QTR.bat or could")
+        say("      not be stopped, so it was left alone. Close its window yourself to stop it.")
     say("Stopped: " + (", ".join(stopped) if stopped else "nothing was running from RUN_QTR.bat"))
     say("Database, logs and configuration were not touched.")
     say("QTR_Trade stopped.")
@@ -324,6 +405,9 @@ def status() -> int:
 
 
 def main(argv: list[str]) -> int:
+    for stream in (sys.stdout, sys.stderr):  # never crash on characters the console code page lacks
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
     command = argv[1] if len(argv) > 1 else "start"
     if command == "start":
         return start(open_browser="--no-browser" not in argv)
