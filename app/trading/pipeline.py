@@ -72,7 +72,7 @@ def closed_before(at: datetime, timeframe: str) -> datetime:
     return TimeService.ensure_utc(at) - TIMEFRAME_DELTA.get(timeframe, timedelta(hours=1))
 
 
-def latest_signals(session: Session, spec: StrategySpec, snapshot: MarketSnapshot) -> tuple[dict[str, bool] | None, str]:
+def latest_signals(session: Session, spec: StrategySpec, snapshot: MarketSnapshot) -> tuple[dict[str, Any] | None, str]:
     """Entry/exit flags of a specification on the latest stored closed candle at snapshot time."""
     compiled = CompiledStrategy(spec)
     interval = TIMEFRAME_DELTA.get(snapshot.timeframe, timedelta(hours=1))
@@ -86,8 +86,11 @@ def latest_signals(session: Session, spec: StrategySpec, snapshot: MarketSnapsho
         return None, "insufficient_candles"
     if TimeService.ensure_utc(snapshot.observed_at) - TimeService.ensure_utc(rows[0].timestamp) > interval * 3:
         return None, "stale_candles"
-    flags = compiled.signals(candles_frame(list(reversed(rows)))).iloc[-1]
-    return {"entry": bool(flags["entry"]), "exit": bool(flags["exit"])}, "ok"
+    frame = candles_frame(list(reversed(rows)))
+    flags = compiled.signals(frame).iloc[-1]
+    return {"entry": bool(flags["entry"]), "exit": bool(flags["exit"]),
+            "candle_open_time": TimeService.ensure_utc(rows[0].timestamp).isoformat(),
+            **compiled.feature_snapshot(frame)}, "ok"
 
 
 class TradingPipeline:
@@ -98,6 +101,8 @@ class TradingPipeline:
         self.session, self.settings, self.event_bus = session, settings, event_bus
         self.quote_provider = quote_provider
         self.ai_provider = ai_provider
+        # Feature values each strategy actually used at decision time (audit trail).
+        self._strategy_evidence: dict[str, dict[str, Any]] = {}
 
     def _entry_signal(self, strategy: Strategy, version: StrategyVersion, snapshot: MarketSnapshot) -> tuple[bool | None, str]:
         """Evaluate a declarative entry rule on stored closed candles known at decision time.
@@ -116,6 +121,7 @@ class TradingPipeline:
             if status == "stale_candles" or not demo:
                 return False, status
             return None, "legacy_direction_insufficient_candles"
+        self._strategy_evidence[version.id] = {key: signals[key] for key in ("candle_open_time", "features", "conditions")}
         return bool(signals["entry"]), "declarative_rule"
 
     async def _quote(self, snapshot: MarketSnapshot) -> tuple[Quote | None, list[str]]:
@@ -143,6 +149,7 @@ class TradingPipeline:
             decision = self._decision(
                 snapshot, "IGNORE", [], 0, [f"Market snapshot rejected: {exc}"], correlation_id
             )
+            decision.rationale = {**self._journal(snapshot, context_in, "DATA_INVALID"), "reason": decision.reasoning[0]}
             self.session.commit()
             return {"decision_id": decision.id, "outcome": "IGNORE", "reasoning": decision.reasoning}
         halted = SafetyService(self.session).evaluation_halted()
@@ -150,6 +157,7 @@ class TradingPipeline:
             decision = self._decision(
                 snapshot, "IGNORE", [], 0, [f"Safety control active: {', '.join(halted)}"], correlation_id
             )
+            decision.rationale = {**self._journal(snapshot, context_in, "SAFETY_HALT"), "reason": decision.reasoning[0]}
             self.session.commit()
             return {"decision_id": decision.id, "outcome": "IGNORE", "reasoning": decision.reasoning}
 
@@ -226,11 +234,17 @@ class TradingPipeline:
                 "content_hash": version.content_hash,
                 "signal_source": signal_source,
                 "lifecycle_status": paper.lifecycle_status,
+                "paper_eligible": paper.eligible,
+                "ineligibility_reasons": paper.reasons,
+                "strategy_evidence": self._strategy_evidence.get(version.id),
             })
             if opportunity.status == "SELECTED":
                 selected = strategy, version, opportunity
 
         rationale: dict[str, Any] = {}
+        reason_code = ("NO_STRATEGY_COVERS_ASSET" if not evaluations else
+                       "STRATEGY_NOT_PAPER_ELIGIBLE" if not any(item["paper_eligible"] for item in evaluations) else
+                       "NO_ENTRY_SIGNAL_OR_CONDITIONS_NOT_MET")
         if selected:
             strategy_selected, version_selected, opportunity_selected = selected
             source = next(item["signal_source"] for item in evaluations if item["opportunity_id"] == opportunity_selected.id)
@@ -241,11 +255,16 @@ class TradingPipeline:
                 review = rationale["ai_review"]
                 mode = self.settings.ai_trade_review
                 if mode == "required" and review.get("decision") != "TRADE":
+                    reason_code = ("AI_UNAVAILABLE" if review.get("status") not in {"OK", "CACHED"} else
+                                   "AI_INVALID_OUTPUT" if review.get("validation_problems") else "AI_NO_TRADE")
                     detail = review.get("error") or "; ".join(review.get("validation_problems") or review.get("reasons") or []) or "no decision"
                     rationale["decision"] = "NO_TRADE"
                     rationale["reason"] = f"Gemini decision required: {review.get('status')} / {review.get('ai_decision') or review.get('decision')} ({detail[:200]})"
                 elif mode == "veto" and review.get("verdict") == "REJECT":
+                    reason_code = "AI_VETO"
                     rationale["decision"], rationale["reason"] = "NO_TRADE", "AI review identified material contradicting evidence (veto mode)"
+            else:
+                reason_code = "EVIDENCE_NO_TRADE"
             if rationale["decision"] == "NO_TRADE":
                 opportunity_selected.status = "REJECTED"
                 opportunity_selected.reasons = [*(opportunity_selected.reasons or []), f"reasoning: {rationale['reason']}"]
@@ -260,6 +279,7 @@ class TradingPipeline:
                          "decision_time": TimeService.ensure_utc(snapshot.observed_at).isoformat(),
                          "strategies_evaluated": len(evaluations)}
         rationale["decision"] = "TRADE" if selected else "NO_TRADE"
+        rationale.update(self._journal(snapshot, context_in, "PENDING_RISK" if selected else reason_code))
         decision = self._decision(
             snapshot,
             outcome,
@@ -323,8 +343,9 @@ class TradingPipeline:
                 ),
                 "portfolio_risk",
             )
-            decision.rationale = {**rationale, "risk": {"outcome": "REJECTED", "reasons": assessment.reason_codes,
-                                                        "quote": _quote_dict(quote)}}
+            decision.rationale = {**rationale, "final_decision": "NO_TRADE", "reason_code": "RISK_REJECTED",
+                                  "risk": {"outcome": "REJECTED", "reasons": assessment.reason_codes,
+                                           "quote": _quote_dict(quote), "sizing": assessment.details}}
             self.session.commit()
             return {
                 "decision_id": decision.id,
@@ -350,11 +371,13 @@ class TradingPipeline:
         self.session.flush()
         entry = float(quote.ask) if quote is not None else float(snapshot.price)
         stop, target = float(assessment.stop_loss), float(assessment.take_profit)
-        decision.rationale = {**rationale, "risk": {"outcome": "APPROVED", "quote": _quote_dict(quote)}, "plan": {
+        decision.rationale = {**rationale, "risk": {"outcome": "APPROVED", "quote": _quote_dict(quote),
+                                                    "sizing": assessment.details}, "plan": {
             "venue": venue, "entry_reference": entry, "stop_loss": stop, "take_profit": [target],
             "expected_reward_risk": round((target - entry) / (entry - stop), 3) if entry > stop else None,
             "quantity": str(assessment.quantity), "notional": str(assessment.notional),
-            "risk_amount": str(assessment.risk_amount), "risk_pct_of_equity": self.settings.max_risk_per_trade,
+            "risk_amount": str(assessment.risk_amount),
+            "risk_pct_of_equity": assessment.details.get("risk_pct_of_equity"),
             "execution_plan_id": plan.id, "order_type": "MARKET"}}
         await publish_persisted(
             self.session,
@@ -373,6 +396,10 @@ class TradingPipeline:
                 plan, intent, snapshot.price, correlation_id
             )
         intent.status = "executed" if execution.get("position_id") else "submitted"
+        filled = bool(execution.get("position_id"))
+        decision.rationale = {**decision.rationale, "final_decision": "TRADE_EXECUTED" if filled else "NO_TRADE",
+                              "reason_code": "TRADE_EXECUTED" if filled else "EXECUTION_REJECTED",
+                              "execution": {key: execution.get(key) for key in ("order_id", "position_id", "rejected", "errors")}}
         position = self.session.get(Position, execution["position_id"]) if execution.get("position_id") else None
         if position is not None and position.timeframe is None:
             # Monitoring state: the decision candle is already known; REST monitoring starts after it.
@@ -394,6 +421,21 @@ class TradingPipeline:
             **execution,
         }
 
+    @staticmethod
+    def _journal(snapshot: MarketSnapshot, inputs: dict[str, Any], reason_code: str) -> dict[str, Any]:
+        """Decision-journal fields shared by every outcome (trade or NO_TRADE)."""
+        return {
+            "final_decision": "PENDING" if reason_code == "PENDING_RISK" else "NO_TRADE",
+            "reason_code": reason_code,
+            "market_state": {"exchange": snapshot.exchange, "symbol": snapshot.symbol, "timeframe": snapshot.timeframe,
+                             "observed_at": TimeService.ensure_utc(snapshot.observed_at).isoformat(),
+                             "close": snapshot.price, "volume": snapshot.volume, "volatility": snapshot.volatility,
+                             "indicator_regime": snapshot.regime, "trend": snapshot.direction,
+                             "market_regime": snapshot.market_regime, "liquidity": snapshot.liquidity},
+            "candle": inputs.get("candle"), "scanner_evidence": inputs.get("scanner_evidence"),
+            "provider_errors": inputs.get("provider_errors") or [],
+        }
+
     async def _ai_review(self, rationale: dict[str, Any]) -> dict[str, Any]:
         if self.settings.ai_trade_review == "off":
             return {"status": "DISABLED", "verdict": None}
@@ -404,7 +446,11 @@ class TradingPipeline:
         if not provider.configured:
             return {"status": "NOT_CONFIGURED", "verdict": None,
                     "fallback": "deterministic evidence rules only (AI review not performed)"}
-        review = await AIResearchService(self.session, self.settings, self.event_bus, provider).review_trade(rationale)
+        try:
+            review = await AIResearchService(self.session, self.settings, self.event_bus, provider).review_trade(rationale)
+        except Exception as exc:  # timeouts/network errors: recorded as unavailable, never a trade
+            return {"status": "UNAVAILABLE", "decision": None, "verdict": None, "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+                    "mode": self.settings.ai_trade_review, "decided_at": TimeService.now().isoformat()}
         return {**review, "mode": self.settings.ai_trade_review}
 
     def _has_candles(self, snapshot: MarketSnapshot) -> bool:

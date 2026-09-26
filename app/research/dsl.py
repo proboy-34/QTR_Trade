@@ -176,6 +176,31 @@ class CompiledStrategy:
             result = (left < right) & (left.shift(1) >= right.shift(1))
         return result.fillna(False).astype(bool)
 
+    def feature_snapshot(self, frame: pd.DataFrame) -> dict[str, Any]:
+        """Values of exactly the features this specification uses, on the last bar of `frame`
+        (and the bar before, which cross conditions compare against), plus each condition's result.
+        Computed with the same code as the signals, on the same closed candles — nothing extra."""
+        cache: dict[str, pd.Series] = {}
+        values: dict[str, Any] = {}
+        conditions: list[dict[str, Any]] = []
+
+        def value(series: pd.Series, offset: int) -> float | None:
+            if len(series) < offset:
+                return None
+            item = series.iloc[-offset]
+            return round(float(item), 10) if pd.notna(item) else None
+
+        for kind, items in (("entry", self.spec.entry), ("exit", self.spec.exit)):
+            for condition in items:
+                for operand in (condition.left, condition.right):
+                    if isinstance(operand, str) and operand not in values:
+                        series = self._series(frame, operand, cache)
+                        values[operand] = {"last": value(series, 1), "previous": value(series, 2)}
+                result = self._evaluate(frame, condition, cache)
+                conditions.append({"kind": kind, "rule": f"{condition.left} {condition.operator} {condition.right}",
+                                   "result": bool(result.iloc[-1]) if len(result) else False})
+        return {"features": values, "conditions": conditions}
+
     def signals(self, frame: pd.DataFrame) -> pd.DataFrame:
         """Entry/exit flags known at each bar's close. Execution must use the next bar."""
         cache: dict[str, pd.Series] = {}

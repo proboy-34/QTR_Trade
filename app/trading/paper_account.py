@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 from app.core.config import Settings
 from app.core.decimal_math import ONE, ZERO, decimal, money, rate
 from app.core.time import TimeService
-from app.models import Order, PortfolioSnapshot, Position
+from app.models import Order, PaperAccountRecord, PortfolioSnapshot, Position
 
 OPEN_STATES = ("OPENING", "OPEN", "MANAGING", "PARTIALLY_CLOSING", "CLOSING")
 
@@ -31,9 +31,21 @@ class PaperAccount:
     def __init__(self, session: Session, settings: Settings) -> None:
         self.session, self.settings = session, settings
 
+    def record(self) -> PaperAccountRecord:
+        """The persisted account; created once from STARTING_EQUITY (default $100,000)."""
+        account = self.session.scalar(select(PaperAccountRecord).where(PaperAccountRecord.venue == self.venue))
+        if account is None:
+            account = PaperAccountRecord(venue=self.venue, currency="USD", initial_capital=money(decimal(self.settings.starting_equity)))
+            self.session.add(account)
+            self.session.flush()
+        return account
+
+    def initial_capital(self) -> Decimal:
+        return decimal(self.record().initial_capital)
+
     def totals(self) -> dict[str, Decimal]:
         positions = self.session.scalars(select(Position).where(Position.venue == self.venue)).all()
-        starting = decimal(self.settings.starting_equity)
+        starting = self.initial_capital()
         realized = sum((decimal(item.realized_pnl) for item in positions), ZERO)
         fees = sum((decimal(item.fees) for item in positions), ZERO)
         open_positions = [item for item in positions if item.status in OPEN_STATES]
@@ -75,9 +87,14 @@ class PaperAccount:
         peak = max([decimal(row[1]) for row in curve] + [totals["starting_equity"]])
         max_dd = max([decimal(row[2]) for row in curve] + [ZERO])
         starting = totals["starting_equity"]
+        configured = money(decimal(self.settings.starting_equity))
         return {
-            "venue": "paper", "execution_mode": "PAPER", "market_data_source": "REAL_BINANCE",
-            "initial_balance": str(money(starting)), "cash_available": str(money(totals["cash"])),
+            "venue": "paper", "execution_mode": "PAPER", "market_data_source": "REAL_BINANCE", "currency": "USD",
+            "initial_balance": str(money(starting)),
+            "configured_starting_equity": str(configured),
+            # The persisted initial capital is authoritative; a differing STARTING_EQUITY is ignored.
+            "configured_starting_equity_ignored": configured != money(starting),
+            "cash_available": str(money(totals["cash"])),
             "reserved_capital": str(money(totals["open_cost"])), "open_exposure": str(money(totals["market_value"])),
             "equity": str(money(totals["equity"])), "unrealized_pnl": str(money(totals["unrealized_pnl"])),
             "realized_pnl": str(money(totals["realized_pnl"])), "fees_paid": str(money(totals["fees"])),

@@ -662,3 +662,129 @@ def strategies_lifecycle(session: Session = Depends(get_db)) -> dict:
 
 def _text(value: Any) -> str | None:
     return None if value is None else str(value)
+
+
+def _plain(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _plain(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(item) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+@router.get("/paper/trades/{position_id}")
+def paper_trade_record(position_id: str, session: Session = Depends(get_db)) -> dict:
+    """Complete audit record of one paper trade: identity, timing, market state, the features the
+    strategy used, the Gemini decision, the risk decision, execution and outcome."""
+    from app.memory.trade_memory import TradeMemoryService
+    from app.models import (
+        Fill,
+        Position,
+        PositionEvent,
+        PostTradeAnalysis,
+        StrategyVersion,
+        TradeMemory,
+    )
+
+    position = session.get(Position, position_id)
+    if position is None:
+        raise NotFoundError("Paper trade not found")
+    chain = TradeMemoryService(session).chain(position)
+    order, plan, intent, decision = chain["order"], chain["plan"], chain["intent"], chain["decision"]
+    version = session.get(StrategyVersion, position.strategy_version_id)
+    rationale = (decision.rationale or {}) if decision else {}
+    evaluation = next((item for item in (decision.evaluations or []) if decision and
+                       item.get("strategy_version_id") == position.strategy_version_id), None) if decision else None
+    memory = session.scalar(select(TradeMemory).where(TradeMemory.position_id == position.id))
+    analysis = session.scalar(select(PostTradeAnalysis).where(PostTradeAnalysis.trade_memory_id == memory.id)) if memory else None
+    fills = session.scalars(select(Fill).where(Fill.order_id == order.id)).all() if order else []
+    events = session.scalars(select(PositionEvent).where(PositionEvent.position_id == position.id)
+                             .order_by(PositionEvent.occurred_at)).all()
+    return _plain({
+        "identity": {"trade_id": position.id, "order_id": order.id if order else None, "symbol": position.symbol,
+                     "side": position.side, "strategy_id": version.strategy_id if version else None,
+                     "strategy_name": version.strategy.name if version and version.strategy else None,
+                     "strategy_version_id": position.strategy_version_id, "strategy_version": version.version if version else None,
+                     "strategy_content_hash": version.content_hash if version else None, "timeframe": position.timeframe,
+                     "decision_id": decision.id if decision else None, "execution_plan_id": plan.id if plan else None},
+        "timing": {"decision_time": rationale.get("decision_time"), "candle": rationale.get("candle"),
+                   "decision_recorded_at": decision.created_at if decision else None,
+                   "entry_at": position.opened_at, "exit_at": position.closed_at},
+        "market_state": {**(rationale.get("market_state") or {}), "regime": rationale.get("market_regime"),
+                         "scanner_evidence": rationale.get("scanner_evidence")},
+        "strategy_evidence": evaluation.get("strategy_evidence") if evaluation else None,
+        "decision_evidence": {key: rationale.get(key) for key in ("supporting_evidence", "contradicting_evidence",
+                                                                   "blocking_evidence", "evidence_strength", "thesis",
+                                                                   "invalidation", "time_horizon", "macro_context",
+                                                                   "news_context", "data_sources", "risk_config_version")},
+        "ai_decision": rationale.get("ai_review"),
+        "risk_decision": rationale.get("risk"),
+        "plan": rationale.get("plan"),
+        "execution": {"requested_entry": intent.entry_price if intent else None,
+                      "order": {"status": order.status, "execution_mode": order.execution_mode,
+                                "market_data_source": order.market_data_source, "bid": order.bid, "ask": order.ask,
+                                "reference_price": order.reference_price, "quote_at": order.quote_at,
+                                "average_fill_price": order.average_fill_price, "quantity": order.fill_quantity,
+                                "notional": (order.average_fill_price or 0) * order.fill_quantity,
+                                "fees": order.fees, "slippage_cost": order.slippage_cost} if order else None,
+                      "fills": [{"price": fill.price, "quantity": fill.quantity, "fee": fill.fee, "at": fill.filled_at} for fill in fills],
+                      "assumptions": {"buy_at": "real ask + slippage", "sell_at": "real bid - slippage (take-profit at target)",
+                                      "fee_rate": get_settings().paper_fee_rate, "slippage_rate": get_settings().paper_slippage_rate,
+                                      "fills": "SIMULATED (paper), never exchange fills"}},
+        "position": {"status": position.status, "quantity": position.quantity, "entry_price": position.entry_price,
+                     "stop_loss": position.stop_loss, "take_profit": position.take_profit, "current_price": position.current_price,
+                     "unrealized_pnl": position.unrealized_pnl, "bars_held": position.bars_held,
+                     "max_holding_bars": position.max_holding_bars, "last_evaluated_candle_at": position.last_evaluated_candle_at},
+        "outcome": {"exit_price": position.exit_price, "exit_reason": position.exit_reason,
+                    "gross_pnl": position.realized_pnl, "fees": position.fees, "slippage_cost": position.slippage_cost,
+                    "net_pnl": (position.realized_pnl - position.fees) if position.status == "CLOSED" else None,
+                    "return_pct": memory.return_pct if memory else None, "r_multiple": memory.r_multiple if memory else None,
+                    "mfe_pct": memory.mfe_pct if memory else None, "mae_pct": memory.mae_pct if memory else None,
+                    "holding_seconds": memory.holding_seconds if memory else None,
+                    "result": (("WIN" if position.realized_pnl - position.fees > 0 else "LOSS") if position.status == "CLOSED" else "OPEN")},
+        "events": [{"type": item.event_type, "price": item.price, "reason": item.reason, "at": item.occurred_at} for item in events],
+        "post_trade_analysis": {"expected": analysis.expected, "actual": analysis.actual, "lesson": analysis.lesson,
+                                "entry_quality": analysis.entry_quality, "exit_quality": analysis.exit_quality}
+        if analysis else None,
+    })
+
+
+@router.get("/decisions/journal")
+def decision_journal(symbol: str | None = None, reason_code: str | None = None, final_decision: str | None = None,
+                     limit: int = Query(200, ge=1, le=5000), session: Session = Depends(get_db)) -> dict:
+    """Every evaluation (trade and NO_TRADE) with its exact reason, newest first."""
+    from app.models import Decision
+
+    query = select(Decision).order_by(desc(Decision.created_at))
+    if symbol:
+        query = query.where(Decision.symbol == symbol.upper())
+    rows = session.scalars(query.limit(limit * 3 if (reason_code or final_decision) else limit)).all()
+    items = []
+    for row in rows:
+        rationale = row.rationale or {}
+        item = {
+            "decision_id": row.id, "recorded_at": row.created_at, "symbol": row.symbol, "timeframe": row.timeframe,
+            "decision_time": rationale.get("decision_time"), "candle_open_time": (rationale.get("candle") or {}).get("open_time"),
+            "final_decision": rationale.get("final_decision") or ("NO_TRADE" if row.outcome != "TRADE" else "TRADE"),
+            "reason_code": rationale.get("reason_code"), "reason": rationale.get("reason") or next(iter(row.reasoning or []), None),
+            "strategies_evaluated": [{"strategy": item.get("strategy"), "version": item.get("version"),
+                                      "strategy_version_id": item.get("strategy_version_id"),
+                                      "paper_eligible": item.get("paper_eligible"), "eligible": item.get("eligible"),
+                                      "ineligibility_reasons": item.get("ineligibility_reasons"), "reasons": item.get("reasons")}
+                                     for item in (row.evaluations or [])],
+            "market_state": rationale.get("market_state"),
+            "ai": {key: (rationale.get("ai_review") or {}).get(key) for key in ("status", "decision", "confidence", "reasons", "model")}
+            if rationale.get("ai_review") else None,
+            "risk": {key: (rationale.get("risk") or {}).get(key) for key in ("outcome", "reasons")} if rationale.get("risk") else None,
+        }
+        if reason_code and item["reason_code"] != reason_code:
+            continue
+        if final_decision and item["final_decision"] != final_decision:
+            continue
+        items.append(item)
+        if len(items) >= limit:
+            break
+    counts = dict(session.execute(select(Decision.outcome, func.count()).group_by(Decision.outcome)).all())
+    return _plain({"items": items, "outcome_counts": counts})

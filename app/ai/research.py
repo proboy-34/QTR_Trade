@@ -276,10 +276,13 @@ class AIResearchService:
             "stop_loss < entry < take_profit.")
         if outcome.get("status") not in {"OK", "CACHED"}:
             return {"status": outcome.get("status", "UNAVAILABLE"), "error": outcome.get("error"), "decision": None,
+                    "provider": self.provider.name, "decided_at": TimeService.now().isoformat(),
                     "verdict": None, "fallback": "NO_TRADE unless the configured mode allows deterministic-only decisions"}
         artifact = self.session.get(AIArtifact, outcome["artifact_id"])
         proposal = next((item for item in (artifact.proposals if artifact else []) if isinstance(item, dict)), {})
         return {"status": outcome["status"], "artifact_id": outcome["artifact_id"], **parse_trade_decision(proposal),
+                "provider": self.provider.name, "model": artifact.model if artifact else None,
+                "ai_call_id": artifact.ai_call_id if artifact else None, "decided_at": TimeService.now().isoformat(),
                 "verification": artifact.verification if artifact else {}}
 
 

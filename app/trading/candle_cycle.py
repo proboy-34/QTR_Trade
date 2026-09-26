@@ -140,7 +140,8 @@ class ClosedCandleCycle:
         now = TimeService.ensure_utc(self.clock())
         report: dict[str, Any] = {"now": now.isoformat(), "exchange": self.exchange, "timeframes": {}}
         with self.session_factory() as session:
-            report["interrupted_marked"] = self._mark_interrupted(session, now)
+            # Claims are stamped with wall-clock time, so their age is measured against it too.
+            report["interrupted_marked"] = self._mark_interrupted(session, TimeService.now())
         for timeframe in self.settings.csv("scanner_timeframes"):
             report["timeframes"][timeframe] = await self._timeframe(timeframe, now)
         with self.session_factory() as session:
@@ -291,6 +292,7 @@ class ClosedCandleCycle:
                 inputs = {
                     "candle": {"exchange": self.exchange, "symbol": symbol, "timeframe": timeframe,
                                "open_time": last_open.isoformat(), "close_time": decision_time.isoformat(),
+                               "open": str(rows[0].open), "high": str(rows[0].high), "low": str(rows[0].low),
                                "close": str(rows[0].close), "volume": str(rows[0].volume), "source": "binance_rest_klines"},
                     "scanner_evidence": ({"opportunity_id": scanner.id, "signals": scanner.signals, "rank_score": scanner.rank_score}
                                          if scanner else None),

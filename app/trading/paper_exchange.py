@@ -84,7 +84,7 @@ class PaperExchange:
         )
         validation_errors = list(validation.errors)
         latest = latest_portfolio(self.session, "paper")
-        available = decimal(latest.available_balance) if latest else decimal(self.settings.starting_equity)
+        available = decimal(latest.available_balance) if latest else PaperAccount(self.session, self.settings).initial_capital()
         leverage = decimal(plan.leverage)
         if leverage <= ZERO:
             validation_errors.append("INVALID_LEVERAGE")

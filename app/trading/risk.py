@@ -51,6 +51,8 @@ class RiskAssessment:
     take_profit: Decimal = ZERO
     leverage: Decimal = ONE
     notional: Decimal = ZERO
+    # Audit detail of the sizing decision (proposed vs approved size, R:R, exposure, risk %).
+    details: dict[str, Any] = field(default_factory=dict)
 
 
 class RiskEngine:
@@ -64,7 +66,12 @@ class RiskEngine:
     def assess(self, intent: TradeIntent, market_price: float, volatility: float,
                facts: MarketFacts | None = None) -> RiskAssessment:
         portfolio = latest_portfolio(self.session, self.venue)
-        equity = decimal(portfolio.equity) if portfolio else decimal(self.settings.starting_equity)
+        if portfolio is None and self.venue == "paper":
+            from app.trading.paper_account import PaperAccount
+
+            equity = PaperAccount(self.session, self.settings).initial_capital()
+        else:
+            equity = decimal(portfolio.equity) if portfolio else decimal(self.settings.starting_equity)
         available = decimal(portfolio.available_balance) if portfolio else equity
         exposure = decimal(portfolio.exposure) if portfolio else ZERO
         daily_pnl = decimal(portfolio.daily_pnl) if portfolio else ZERO
@@ -136,6 +143,7 @@ class RiskEngine:
             return self._record(intent, RiskAssessment(False, reasons))
         risk_amount = money(equity * decimal(self.settings.max_risk_per_trade))
         raw_quantity = risk_amount / abs(market - stop_loss)
+        proposed_quantity = raw_quantity  # size implied by the per-trade risk budget, before caps
         remaining_exposure = max(ZERO, decimal(self.settings.max_total_exposure) - exposure)
         raw_quantity = min(raw_quantity, equity * remaining_exposure / market)
         portfolio_view: dict[str, Any] = PortfolioIntelligence(self.session, venue=self.venue).assess_candidate(
@@ -177,15 +185,38 @@ class RiskEngine:
         actual_risk = abs(market - stop_loss) * final_quantity
         if equity > ZERO and actual_risk > equity * decimal(self.settings.max_risk_per_trade) * decimal("1.0001"):
             reasons.append("RISK_PER_TRADE_EXCEEDED")
+        # Total risk to stops across all open positions on this venue, including this trade.
+        open_risk = sum((abs(decimal(item.entry_price) - decimal(item.stop_loss)) * decimal(item.quantity)
+                         for item in self.session.scalars(select(Position).where(
+                             Position.venue == self.venue, Position.status.in_(["OPENING", "OPEN", "MANAGING"]))).all()),
+                        ZERO)
+        if equity > ZERO and open_risk + actual_risk > equity * decimal(self.settings.max_portfolio_risk) * decimal("1.0001"):
+            reasons.append("PORTFOLIO_RISK_LIMIT")
+        details = {
+            "equity": str(money(equity)), "available_cash": str(money(available)), "reference_price": str(market),
+            "proposed_quantity": str(quantity(proposed_quantity, step_size)), "approved_quantity": str(final_quantity),
+            "notional": str(notional), "risk_amount": str(money(actual_risk)),
+            "risk_pct_of_equity": round(float(actual_risk / equity * 100), 4) if equity > ZERO else None,
+            "risk_budget_pct": self.settings.max_risk_per_trade * 100,
+            "stop_distance_pct": round(float(stop_fraction * 100), 4), "target_distance_pct": round(float(target_fraction * 100), 4),
+            "reward_risk": round(float(target_fraction / stop_fraction), 3),
+            "exposure_before": str(rate(exposure)), "exposure_after": str(rate(exposure + notional / equity)) if equity > ZERO else None,
+            "open_portfolio_risk_before": str(money(open_risk)),
+            "portfolio_risk_pct_after": round(float((open_risk + actual_risk) / equity * 100), 4) if equity > ZERO else None,
+            "limits": {"max_total_exposure": self.settings.max_total_exposure, "max_portfolio_risk": self.settings.max_portfolio_risk,
+                       "max_symbol_concentration": self.settings.max_symbol_concentration,
+                       "min_reward_risk": self.settings.min_reward_risk},
+        }
         assessment = RiskAssessment(
             not reasons,
             reasons,
             final_quantity,
-            risk_amount,
+            money(actual_risk),
             stop_loss,
             take_profit,
             leverage,
             notional,
+            details,
         )
         return self._record(intent, assessment, portfolio_view)
 
@@ -244,6 +275,7 @@ class RiskEngine:
                 "portfolio_equity": str(portfolio.equity) if portfolio else None,
                 "portfolio_exposure": str(portfolio.exposure) if portfolio else None,
                 "portfolio_intelligence": portfolio_view,
+                "sizing": assessment.details,
             },
         ))
         intent.status = "risk_approved" if assessment.approved else "risk_rejected"

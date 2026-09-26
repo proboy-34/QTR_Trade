@@ -886,3 +886,15 @@ class ProcessedCandle(Base):
     decision_id: Mapped[str | None] = mapped_column(String(36), index=True)
     detail: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     processed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=TimeService.now, index=True)
+
+
+class PaperAccountRecord(Base):
+    """The paper account's fixed initial capital, persisted once. The ledger is always derived from
+    this value plus positions, so editing STARTING_EQUITY later can never create or remove capital."""
+
+    __tablename__ = "paper_accounts"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    venue: Mapped[str] = mapped_column(String(20), unique=True)
+    currency: Mapped[str] = mapped_column(String(10), default="USD")
+    initial_capital: Mapped[Decimal] = mapped_column(MONEY)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=TimeService.now)

@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     max_daily_loss: float = Field(0.03, gt=0, le=0.25)
     max_drawdown: float = Field(0.15, gt=0, le=0.50)
     max_open_positions: int = Field(5, ge=1, le=100)
+    # Total risk to stops across all open positions, as a fraction of equity.
+    max_portfolio_risk: float = Field(0.05, gt=0, le=0.25)
     max_leverage: float = Field(1.0, ge=1, le=10)
     paper_immediate_fill: bool = True
     paper_partial_fill_ratio: float = Field(1.0, gt=0, le=1)
